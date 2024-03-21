@@ -777,7 +777,7 @@ static void wrFileName(struct entry *node) {
 	}
 
 	// Find out where the last '/' is in the filename
-	if (!C.fullPath) {
+	if (!C.fullPath && !(filename[0] == '/' && filename[1] == '\0')) {
 		const char *tmp = strrchr(filename, '/');
 		if (tmp != NULL) {
 			filename = tmp + 1;
@@ -907,8 +907,9 @@ renderDisplay(struct entry *root, struct indent_info *stack, int depth, int size
 }
 
 //----------------------------------------------------------
-// Path deduplicator
+// Path deduplication
 //----------------------------------------------------------
+
 // This function normalizes a path by removing all extraneous . .. and / segments
 static size_t normalizePath(char *const path) {
 	const bool absolute = path[0] == '/';
