@@ -1,8 +1,10 @@
 #define _XOPEN_SOURCE 500
+#define _GNU_SOURCE
 #include <asm/termbits.h>
 #include <dirent.h>
 #include <emmintrin.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
 #include <inttypes.h>
 #include <limits.h>
@@ -262,10 +264,9 @@ static bool stack_is_empty(struct stack *s) {
 // All these queues hold the entry of the file. toStat and toList will
 // have blank size and unsearched_children fields
 struct thread_data {
-	struct stack toStat;
 	struct stack toList;
 	struct entry *_Atomic toMain;
-	struct hl_table hl;
+	struct hl_table *hl;
 	_Atomic int num_blocked_threads;
 	_Atomic int main_blocked;
 	_Atomic bool encountered_errors;
@@ -297,103 +298,164 @@ static void finishNode(struct thread_data *T, struct entry *node) {
 		sem_post(&T->main_sem);
 }
 
-static void doStat(struct thread_data *T, struct entry *node) {
-	struct stat sbuf;
-	int result = lstat(node->name, &sbuf);
+static bool statNode(int at_fd, struct stat *sbuf, struct entry *ent, struct hl_table *hl) {
+	const char *name = ent->name;
+	if (at_fd != AT_FDCWD)
+		name = strrchr(name, '/') + 1;
+	int result = fstatat(at_fd, name, sbuf, AT_SYMLINK_NOFOLLOW);
+	if (result == -1)
+		return false;
 
-	if (result == -1) {
-		atomic_store_explicit(&T->encountered_errors, true, memory_order_relaxed);
-		finishNode(T, node);
-		return;
-	}
-
-	node->st_mode = sbuf.st_mode;
+	ent->st_mode = sbuf->st_mode;
 	if (C.fileLength) {
-		node->size = sbuf.st_size;
+		ent->size = sbuf->st_size;
 	} else {
-		node->size = 512 * sbuf.st_blocks;
+		ent->size = 512 * sbuf->st_blocks;
 	}
 
-	if (S_ISDIR(sbuf.st_mode)) {
-		stack_push_many(&T->toList, node, &node->next, 1, &T->num_blocked_threads, &T->worker_sem);
-	} else {
+	if (!S_ISDIR(sbuf->st_mode)) {
 		// Kind of rudimentary. Possible improvement: don't send to toMain at all
-		if (C.dedupHardLinks && sbuf.st_nlink > 1 && hl_already_seen(&T->hl, sbuf.st_dev, sbuf.st_ino)) {
-			node->size = 0;
+		if (C.dedupHardLinks && sbuf->st_nlink > 1 && hl_already_seen(hl, sbuf->st_dev, sbuf->st_ino)) {
+			ent->size = 0;
 		}
-		finishNode(T, node);
 	}
+	return true;
 }
 
-static void doLs(struct thread_data *T, struct entry *node) {
-	DIR *dirp = opendir(node->name);
-	if (dirp == NULL) {
+// From getdents(2)
+struct linux_dirent64 {
+	ino64_t        d_ino;    // 64-bit inode number
+	off64_t        d_off;    // 64-bit offset to next structure
+	unsigned short d_reclen; // Size of this dirent
+	unsigned char  d_type;   // File type
+	char           d_name[]; // Filename (null-terminated)
+};
+
+// node MUST be a directory, and size needs to be already filled out
+static void doLs(struct thread_data *T, struct entry *node, void **buffer, uintptr_t *bufferSize) {
+	int fd = open(node->name, O_DIRECTORY | O_CLOEXEC | O_RDONLY); // Add O_NOFOLLOW?
+	if (fd == -1) {
 		atomic_store_explicit(&T->encountered_errors, true, memory_order_relaxed);
 		finishNode(T, node);
 		return;
 	}
 
-	// In progress entries are stored as a linked list
+	// Getdents loop
 	struct entry *head = NULL;
-	struct entry **lastNextPtr = NULL;
-	int count = 0;
 	while (true) {
-		errno = 0;
-		struct dirent *dent = readdir(dirp);
-		if (dent == NULL) {
-			if (errno == 0) break;
-			atomic_store_explicit(&T->encountered_errors, true, memory_order_relaxed);
+		ssize_t bytesRead = getdents64(fd, *buffer, *bufferSize);
+		if (bytesRead == -1) {
+			if (errno == EINVAL) {
+				// Realloc and try again
+				*bufferSize *= 2;
+				*buffer = realloc(*buffer, *bufferSize);
+				continue;
+			} else {
+				// Actual error
+				atomic_store_explicit(&T->encountered_errors, true, memory_order_relaxed);
+				break;
+			}
+		} else if (bytesRead == 0) {
 			break;
-		} else if (strcmp(dent->d_name, ".") == 0 ||
-			   strcmp(dent->d_name, "..") == 0) {
+		}
+
+		// Loop through buffer
+		intptr_t offset = 0;
+		while (offset < bytesRead) {
+			struct linux_dirent64 *dirent = (struct linux_dirent64*)((char*)(*buffer) + offset);
+			offset += dirent->d_reclen;
+			if (strcmp(dirent->d_name, ".") == 0
+					|| strcmp(dirent->d_name, "..") == 0) {
+				continue;
+			}
+
+			size_t fileLen = strlen(dirent->d_name);
+			size_t newLen = node->nameLen + 2 + strlen(dirent->d_name);
+			struct entry *tmp = (struct entry*)calloc(1, sizeof(struct entry) + newLen);
+
+			memcpy(tmp->name, node->name, node->nameLen);
+			tmp->name[node->nameLen] = '/';
+			memcpy(tmp->name + node->nameLen + 1, dirent->d_name, fileLen);
+			tmp->nameLen = newLen - 1;
+
+			tmp->depth = node->depth + 1;
+			tmp->parent = node;
+
+			tmp->next = head;
+			head = tmp;
+		}
+	}
+
+	// fstatat loop
+	struct entry *dirs = NULL;
+	struct entry **dirsLastPtr = NULL;
+	struct entry *files = NULL;
+	struct entry **filesLastPtr = NULL;
+	uint64_t children = 0;
+	while (head != NULL) {
+		struct entry *tmp = head;
+		head = head->next;
+
+		struct stat sbuf;
+		if (!statNode(fd, &sbuf, tmp, T->hl)) {
+			// do something, idk
+			free(tmp);
+			atomic_store_explicit(&T->encountered_errors, true, memory_order_relaxed);
 			continue;
 		}
 
-		count++;
-		int fileLen = strlen(dent->d_name);
-		int newLen = fileLen + node->nameLen + 2;
-		struct entry *tmp = (struct entry*)calloc(1, sizeof(struct entry) + newLen);
-
-		memcpy(tmp->name, node->name, node->nameLen);
-		tmp->name[node->nameLen] = '/';
-		memcpy(tmp->name + node->nameLen + 1, dent->d_name, fileLen);
-		tmp->nameLen = newLen - 1;
-
-		tmp->depth = node->depth + 1;
-		tmp->parent = node;
-		if (head == NULL) {
-			head = tmp;
+		if (S_ISDIR(sbuf.st_mode)) {
+			if (dirs == NULL) {
+				dirs = tmp;
+			} else {
+				*dirsLastPtr = tmp;
+			}
+			dirsLastPtr = &tmp->next;
+			children++;
 		} else {
-			*lastNextPtr = tmp;
+			if (files == NULL) {
+				files = tmp;
+			} else {
+				*filesLastPtr = tmp;
+			}
+			filesLastPtr = &tmp->next;
+			node->size += tmp->size; // optimize?
 		}
-		lastNextPtr = &tmp->next;
+	}
+	close(fd);
+
+	// deal with output
+	atomic_store(&node->unsearched_children, children);
+	if (dirs != NULL) {
+		stack_push_many(&T->toList, dirs, dirsLastPtr, children, &T->num_blocked_threads, &T->worker_sem);
+	} else {
+		finishNode(T, node);
 	}
 
-	closedir(dirp);
-	atomic_store(&node->unsearched_children, count);
-	if (head == NULL) {
-		finishNode(T, node);
-	} else {
-		stack_push_many(&T->toStat, head, lastNextPtr, count, &T->num_blocked_threads, &T->worker_sem);
+	if (files != NULL) {
+		*filesLastPtr = atomic_load(&T->toMain);
+		while (!atomic_compare_exchange_weak(&T->toMain, filesLastPtr, files));
+		if (atomic_load(&T->main_blocked))
+			sem_post(&T->main_sem);
 	}
+	return;
 }
 
 static int thread_func(void *data) {
 	// Stopping condition: work queues are empty and all other threads are blocked
 	struct thread_data *T = (struct thread_data*)data;
+	uintptr_t bufferSize = 16384;
+	void *buffer = malloc(bufferSize);
 
 	while (true) {
 		struct entry *node;
-		if (NULL != (node = stack_pop(&T->toStat))) {
-			doStat(T, node);
-			continue;
-		} else if (NULL != (node = stack_pop(&T->toList))) {
-			doLs(T, node);
+		if (NULL != (node = stack_pop(&T->toList))) {
+			doLs(T, node, &buffer, &bufferSize);
 			continue;
 		}
 
 		int oldBlocked = atomic_fetch_add(&T->num_blocked_threads, 1);
-		if (!stack_is_empty(&T->toStat) || !stack_is_empty(&T->toList)) {
+		if (!stack_is_empty(&T->toList)) {
 			atomic_fetch_sub(&T->num_blocked_threads, 1);
 			continue;
 		}
@@ -404,11 +466,14 @@ static int thread_func(void *data) {
 			for (int i = 0; i < C.threads; i++) {
 				sem_post(&T->worker_sem);
 			}
+			free(buffer);
 			return 0;
 		}
 		sem_wait(&T->worker_sem);
-		if (atomic_load(&T->num_blocked_threads) == C.threads)
+		if (atomic_load(&T->num_blocked_threads) == C.threads) {
+			free(buffer);
 			return 0;
+		}
 		atomic_fetch_sub(&T->num_blocked_threads, 1);
 	}
 }
@@ -457,23 +522,33 @@ static void pushHeap(struct entry **heap, int *size, struct entry *node) {
 	}
 }
 
-static struct entry **traverseDirs(struct entry *root, int *res_size) {
+static void pushHeapMany(struct entry **heap, int *size, struct entry *nodes) {
+	while (nodes != NULL) {
+		struct entry *tmp = nodes;
+		nodes = nodes->next;
+		if (tmp->depth <= (unsigned)C.maxDepth)
+			pushHeap(heap, size, tmp);
+		else
+			free(tmp);
+	}
+}
+
+static struct entry **
+traverseDirs(struct entry *dirs, struct entry *files, int *res_size, struct hl_table *hl) {
 	struct thread_data T = {
 		.toMain = NULL,
-		.toList = {.head = NULL, .lock = ATOMIC_FLAG_INIT},
-		.toStat = {.head = NULL, .lock = ATOMIC_FLAG_INIT},
-		.hl = {.table = calloc(sizeof(struct hard_link), 131072), .size = 131072, .count = 0},
+		.toList = {.head = dirs, .lock = ATOMIC_FLAG_INIT},
+		.hl = hl,
 		.encountered_errors = false,
 		.num_blocked_threads = 0,
 		.main_blocked = 0,
 	};
-	T.toStat.head = root;
 	sem_init(&T.main_sem, 0, 0);
 	sem_init(&T.worker_sem, 0, 0);
-	mtx_init(&T.hl.lock, mtx_plain);
 
 	int queue_size = 0;
 	struct entry **queue = (struct entry **)malloc(sizeof(struct entry*) * (C.rows + 1));
+	pushHeapMany(queue, &queue_size, files);
 
 	// Spawn I/O threads
 	thrd_t *threads = malloc(sizeof(thrd_t) * C.threads);
@@ -498,15 +573,7 @@ static struct entry **traverseDirs(struct entry *root, int *res_size) {
 			atomic_store(&T.main_blocked, 0);
 			continue;
 		}
-		// Insert into priority queue
-		while (list != NULL) {
-			struct entry *tmp = list;
-			list = list->next;
-			if (tmp->depth <= (unsigned)C.maxDepth)
-				pushHeap(queue, &queue_size, tmp);
-			else
-				free(tmp);
-		}
+		pushHeapMany(queue, &queue_size, list);
 	}
 
 	for (int i = 0; i < C.threads; i++) {
@@ -521,8 +588,6 @@ static struct entry **traverseDirs(struct entry *root, int *res_size) {
 	free(threads);
 	sem_destroy(&T.main_sem);
 	sem_destroy(&T.worker_sem);
-	mtx_destroy(&T.hl.lock);
-	free(T.hl.table);
 	*res_size = queue_size;
 	return queue;
 }
@@ -807,12 +872,17 @@ renderDisplay(struct entry *root, struct indent_info *stack, int depth, int size
 //----------------------------------------------------------
 // Path deduplicator
 //----------------------------------------------------------
-struct entry *makeSearchList(int count, char *paths[]) {
+// Returns root node. dirs and files are output args for children of root and potentially root
+struct entry *
+makeSearchList(int count, char *paths[], struct entry **dirs, struct entry **files, struct hl_table *hl) {
 	struct entry *root;
+	struct stat sbuf;
 	if (count == 0) {
 		root = (struct entry*)calloc(1, sizeof(struct entry) + 2);
 		root->name[0] = '.';
 		root->nameLen = 1;
+		*dirs = root;
+		statNode(AT_FDCWD, &sbuf, root, hl);
 		return root;
 	}
 
@@ -834,7 +904,6 @@ struct entry *makeSearchList(int count, char *paths[]) {
 	}
 
 	// n^2 algorithm to see if any paths are prefixes of any others
-	struct entry **prev_next = &root->next;
 	struct entry *node;
 	int len;
 	for (int i = 0; i < count; i++) {
@@ -859,9 +928,21 @@ struct entry *makeSearchList(int count, char *paths[]) {
 		node->nameLen = len;
 		memcpy(node->name, paths[i], len);
 
-		root->unsearched_children++;
-		*prev_next = node;
-		prev_next = &node->next;
+		// Figure out what list to go in
+		if (!statNode(AT_FDCWD, &sbuf, node, hl)) {
+			fprintf(stderr, "Error resolving argument %s: %s\n", paths[i], strerror(errno));
+			free(node);
+		}
+
+		if (S_ISDIR(sbuf.st_mode)) {
+			root->unsearched_children++;
+			node->next = *dirs;
+			*dirs = node;
+		} else {
+			node->next = *files;
+			*files = node;
+			root->size += node->size;
+		}
 skip:;
 	}
 
@@ -870,11 +951,10 @@ skip:;
 	}
 	free(absPaths);
 	free(lens);
-	if (root->unsearched_children == 1) {
-		struct entry *tmp = root->next;
+	if (root->unsearched_children == 1 && *files == NULL) {
 		free(root);
-		root = tmp;
-		root->parent = NULL;
+		(*dirs)->parent = NULL;
+		return *dirs;
 	}
 	return root;
 }
@@ -977,7 +1057,16 @@ int main(int argc, char* argv[]) {
 		return 1;
 	}
 
-	struct entry *root = makeSearchList(argc - optind, &argv[optind]);
+	const int startTableSize = 131072;
+	struct hl_table hl = {
+		.table = calloc(sizeof(struct hard_link), startTableSize),
+		.size = startTableSize,
+		.count = 0,
+	};
+	mtx_init(&hl.lock, mtx_plain);
+	struct entry *files = NULL;
+	struct entry *dirs = NULL;
+	struct entry *root = makeSearchList(argc - optind, &argv[optind], &dirs, &files, &hl);
 	if (root == NULL) {
 		return 1;
 	}
@@ -986,12 +1075,10 @@ int main(int argc, char* argv[]) {
 		initLsColors();
 	}
 
-	// Don't send traverse the (total) node
-	struct entry *listHead = root;
-	if (root->next != NULL) listHead = root->next;
-
 	int size;
-	struct entry **final_entries = traverseDirs(listHead, &size);
+	struct entry **final_entries = traverseDirs(dirs, files, &size, &hl);
+	mtx_destroy(&hl.lock);
+	free(hl.table);
 
 	if (size != 0) {
 		struct indent_info *stack = (struct indent_info*)malloc(sizeof(struct indent_info) * (C.maxDepth+1));
