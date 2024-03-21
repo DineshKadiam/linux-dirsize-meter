@@ -36,12 +36,14 @@ const char* USAGE =
 "\t-d <n>: depth limit to show in output\n"
 "\t-i <n>: number of spaces for each level of indentation (default 2)\n"
 "\t-n <n>: number of rows to show (default is terminal size - 10)\n"
+"\t-t <n>: number of threads to use"
 "\t-h: show this help message\n";
 
 struct Config {
 	int indentSize;
 	int rows;
 	int maxDepth;
+	int threads;
 	bool color : 1;
 	bool fullPath : 1;
 	bool dedupHardLinks : 1;
@@ -53,6 +55,7 @@ static struct Config C = {
 	.indentSize = 2,
 	.rows = 20,
 	.maxDepth = 10,
+	.threads = 4,
 	.color = true,
 	.fullPath = false,
 	.dedupHardLinks = true,
@@ -265,7 +268,6 @@ struct thread_data {
 	struct stack toList;
 	struct entry *_Atomic toMain;
 	struct hl_table hl;
-	int num_threads;
 	_Atomic int num_blocked_threads;
 	_Atomic int main_blocked;
 	sem_t worker_sem;
@@ -398,16 +400,16 @@ static int thread_func(void *data) {
 			continue;
 		}
 
-		if (oldBlocked == T->num_threads - 1) {
+		if (oldBlocked == C.threads - 1) {
 			// We're the last thread left, so we need to wake everyone up to die
 			sem_post(&T->main_sem);
-			for (int i = 0; i < T->num_threads; i++) {
+			for (int i = 0; i < C.threads; i++) {
 				sem_post(&T->worker_sem);
 			}
 			return 0;
 		}
 		sem_wait(&T->worker_sem);
-		if (atomic_load(&T->num_blocked_threads) == T->num_threads)
+		if (atomic_load(&T->num_blocked_threads) == C.threads)
 			return 0;
 		atomic_fetch_sub(&T->num_blocked_threads, 1);
 	}
@@ -463,7 +465,6 @@ static struct entry **traverseDirs(struct entry *root, int *res_size) {
 		.toList = {.head = NULL},
 		.toStat = {.head = NULL},
 		.hl = {.table = NULL, .size = 0, .count = 0},
-		.num_threads = 11,
 		.num_blocked_threads = 0,
 		.main_blocked = 0,
 	};
@@ -478,8 +479,8 @@ static struct entry **traverseDirs(struct entry *root, int *res_size) {
 	struct entry **queue = (struct entry **)malloc(sizeof(struct entry*) * (C.rows + 1));
 
 	// Spawn I/O threads
-	thrd_t *threads = malloc(sizeof(thrd_t) * T.num_threads);
-	for (int i = 0; i < T.num_threads; i++) {
+	thrd_t *threads = malloc(sizeof(thrd_t) * C.threads);
+	for (int i = 0; i < C.threads; i++) {
 		// TODO error handling
 		thrd_create(&threads[i], thread_func, &T);
 	}
@@ -491,7 +492,7 @@ static struct entry **traverseDirs(struct entry *root, int *res_size) {
 			// Have to recheck the stack to prevent deadlock
 			if (atomic_load(&T.toMain) == NULL) {
 				// When every thread is blocked, they all exit
-				if (atomic_load(&T.num_blocked_threads) == T.num_threads)
+				if (atomic_load(&T.num_blocked_threads) == C.threads)
 					break;
 				sem_wait(&T.main_sem);
 			}
@@ -509,7 +510,7 @@ static struct entry **traverseDirs(struct entry *root, int *res_size) {
 		}
 	}
 
-	for (int i = 0; i < T.num_threads; i++) {
+	for (int i = 0; i < C.threads; i++) {
 		thrd_join(threads[i], NULL);
 	}
 
@@ -555,12 +556,12 @@ static struct {
 	{"34;42", "01;34", "01;32", NULL},
 };
 
-static void freeLsColors() {
+static void freeLsColors(void) {
 	free(color_g.env);
 	free(color_g.exts);
 }
 
-static void initLsColors() {
+static void initLsColors(void) {
 	char *tmp = getenv("LS_COLORS");
 	if (tmp == NULL || *tmp == '\0') {
 		C.color = false;
@@ -834,6 +835,8 @@ struct entry *makeSearchList(int count, char *paths[]) {
 
 	// n^2 algorithm to see if any paths are prefixes of any others
 	struct entry **prev_next = &root->next;
+	struct entry *node;
+	int len;
 	for (int i = 0; i < count; i++) {
 		if (absPaths[i] == NULL) continue;
 		for (int j = 0; j < count; j++) {
@@ -850,8 +853,8 @@ struct entry *makeSearchList(int count, char *paths[]) {
 			}
 		}
 
-		int len = strlen(paths[i]);
-		struct entry *node = (struct entry*)calloc(1, sizeof(struct entry) + len + 1);
+		len = strlen(paths[i]);
+		node = (struct entry*)calloc(1, sizeof(struct entry) + len + 1);
 		node->parent = root;
 		node->nameLen = len;
 		memcpy(node->name, paths[i], len);
@@ -877,14 +880,10 @@ skip:;
 }
 
 //----------------------------------------------------------
-// Venerable main
+// Main and arg parsing
 //----------------------------------------------------------
 
-int main(int argc, char* argv[]) {
-	// This has to be done before any printing
-	setvbuf(stdout, NULL, _IONBF, 0);
-
-	// Default options
+void fillOutDefaults(void) {
 	bool isTty = isatty(STDOUT_FILENO);
 	C.color = isTty;
 	char* no_color = getenv("NO_COLOR");
@@ -900,10 +899,22 @@ int main(int argc, char* argv[]) {
 		if (C.rows < 10) C.rows = 10;
 	}
 
+	// Linuxism
+	const int num_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+	if (num_cpus + 1 > C.threads) {
+		C.threads = num_cpus + 1;
+	}
+}
+
+int main(int argc, char* argv[]) {
+	// This has to be done before any printing
+	setvbuf(stdout, NULL, _IONBF, 0);
+
 	// Parse arguments
+	fillOutDefaults();
 	bool argErrors = false;
 	while (true) {
-		int c = getopt(argc, argv, "cCFlbsi:n:d:h");
+		int c = getopt(argc, argv, "cCFlbsi:n:d:t:h");
 		if (c == -1)
 			break;
 
@@ -945,6 +956,15 @@ int main(int argc, char* argv[]) {
 		case 'd':
 			// max depth
 			if (!parseInt(optarg, &C.maxDepth, "max depth")) {
+				argErrors = true;
+			}
+			break;
+		case 't':
+			if (!parseInt(optarg, &C.threads, "number of threads")) {
+				argErrors = true;
+			}
+			if (C.threads == 0) {
+				fprintf(stderr, "Error: at least one thread is required\n");
 				argErrors = true;
 			}
 			break;
@@ -995,6 +1015,5 @@ int main(int argc, char* argv[]) {
 }
 
 // TODO:
-// - Better handling of multiple search directories
 // - Error handling
 // - Colored help text
