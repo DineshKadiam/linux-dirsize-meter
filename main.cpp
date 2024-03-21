@@ -5,6 +5,7 @@
 #include <dirent.h>
 #include <getopt.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <string.h>
 
 #include <queue>
@@ -325,6 +326,42 @@ traverseDirs(std::queue<entry*> &&toSearch, struct entry *root) {
 // Rendering functions
 //----------------------------------------------------------
 
+void renderHumanReadable(uint64_t size) {
+	static const char *suffixes = "BKMGTP";
+	// Sizes greater than 1023P are unsupported
+	static const uint64_t maxSize = (uint64_t)1024 * 1024 * 1024 * 1024 * 1024 * 1023;
+	if (size > maxSize) {
+		wr(" HUGE ");
+		return;
+	}
+
+	// Get order of magnitude and reduce size
+	size *= 10;
+	const char *suffix = suffixes;
+	while (size > 10240) {
+		size /= 1024;
+		suffix++;
+	}
+
+	// Render the string
+	uint8_t decimal = size % 10;
+	size /= 10;
+	char finalBuf[7] = {0};
+	int len = sprintf(finalBuf, "%" PRIu64, size);
+	if (len <= 2) {
+		finalBuf[len++] = '.';
+		finalBuf[len++] = decimal + '0';
+	}
+	finalBuf[len++] = *suffix;
+	finalBuf[len++] = ' ';
+
+	// Pad to 6 characters and write result
+	for (int i = len; i < 6; i++) {
+		wr(" ");
+	}
+	wr(finalBuf);
+}
+
 void
 renderDisplay(struct entry *root, int idx, int depth, int size, struct entry **arr) {
 	// Find children, remove them from the array and sort them
@@ -348,8 +385,17 @@ renderDisplay(struct entry *root, int idx, int depth, int size, struct entry **a
 		renderDisplay(children[j], childs - j - 1, depth + 1, size, arr);
 	}
 
-	// render self
-	// TODO print size
+	// render self, starting with size
+	if (!C.humanReadable) {
+		// Pad out to 16 characters for size
+		char sizeBuf[17] = {0};
+		snprintf(sizeBuf, 17, "%15" PRIu64 " ", root->size);
+		wr(sizeBuf);
+	} else {
+		renderHumanReadable(root->size);
+	}
+
+	// Indentation
 	while (depth > 1) {
 		wr("|");
 		for (int i = 1; i < C.indentSize; i++) {
@@ -358,6 +404,7 @@ renderDisplay(struct entry *root, int idx, int depth, int size, struct entry **a
 		depth--;
 	}
 
+	// "tree" form
 	if (depth == 1) {
 		if (idx == 0) {
 			wr("/- ");
@@ -412,10 +459,10 @@ int main(int argc, char* argv[]) {
 		case 'l':
 			C.dedupHardLinks = false;
 			break;
-		case 'b':
+		case 's':
 			C.fileLength = true;
 			break;
-		case 's':
+		case 'b':
 			C.humanReadable = false;
 			break;
 		case 'i':
@@ -495,8 +542,7 @@ int main(int argc, char* argv[]) {
 }
 
 // TODO:
-// - Display queue as tree
-// - Option granularity
-// - Human readable numbers
 // - LS_COLORS
 // - Custom lock-free stack instead of the locking mess
+// - Unicode tree
+// - Detect size of tty
