@@ -72,11 +72,11 @@ struct entry {
 // Utility functions
 //----------------------------------------------------------
 
-char *displayBuf = NULL;
+static char *displayBuf = NULL;
 // Size of stored data (there is no '\0' at the end)
-size_t displayPos = 0;
+static size_t displayPos = 0;
 // Write the string to the output buffer, reallocating if necessary
-void wr(const char *str) {
+static void wr(const char *str) {
 	// Size of allocated buffer
 	static size_t size = 0;
 
@@ -91,7 +91,7 @@ void wr(const char *str) {
 }
 
 // Parse an int of up to 4 digits, printing an error if necessary
-bool parseInt(const char *input, int *output, const char *paramName) {
+static bool parseInt(const char *input, int *output, const char *paramName) {
 	int len = strlen(input);
 	if (len >= 4) {
 		fprintf(stderr, "Error: specified %s is too large\n", paramName);
@@ -113,7 +113,7 @@ bool parseInt(const char *input, int *output, const char *paramName) {
 }
 
 // Insert entry into sorted array
-void insertSorted(struct entry *thing, int size, struct entry **arr) {
+static void insertSorted(struct entry *thing, int size, struct entry **arr) {
 	int i = size;
 	// Set i to where thing needs to go
 	while (i > 0 && thing->size < arr[i-1]->size) i--;
@@ -128,7 +128,7 @@ void insertSorted(struct entry *thing, int size, struct entry **arr) {
 	arr[i] = thing;
 }
 
-bool entryComparator(const struct entry *a, const struct entry *b) {
+static bool entryComparator(const struct entry *a, const struct entry *b) {
 	if (a->size == b->size) {
 		// the "bigger" entry is the one with the smaller depth
 		return a->depth < b->depth;
@@ -145,16 +145,16 @@ struct stack {
 	mtx_t mtx;
 };
 
-void stack_init(struct stack *s) {
+static void stack_init(struct stack *s) {
 	s->head = NULL;
 	mtx_init(&s->mtx, mtx_plain);
 }
 
-void stack_free(struct stack *s) {
+static void stack_free(struct stack *s) {
 	mtx_destroy(&s->mtx);
 }
 
-struct entry *stack_pop(struct stack *s) {
+static struct entry *stack_pop(struct stack *s) {
 	mtx_lock(&s->mtx);
 	struct entry *ent = s->head;
 	if (ent != NULL) {
@@ -164,7 +164,7 @@ struct entry *stack_pop(struct stack *s) {
 	return ent;
 }
 
-void stack_push_many(
+static void stack_push_many(
 		struct stack *s,
 		struct entry *node,
 		struct entry **last_next,
@@ -183,11 +183,11 @@ void stack_push_many(
 	}
 }
 
-void stack_push(struct stack *s, struct entry *node, _Atomic int *num_blocked_threads, sem_t *sema) {
+static void stack_push(struct stack *s, struct entry *node, _Atomic int *num_blocked_threads, sem_t *sema) {
 	stack_push_many(s, node, &node->next, 1, num_blocked_threads, sema);
 }
 
-bool stack_is_empty(struct stack *s) {
+static bool stack_is_empty(struct stack *s) {
 	mtx_lock(&s->mtx);
 	bool result = s->head == NULL;
 	mtx_unlock(&s->mtx);
@@ -214,7 +214,7 @@ struct thread_data {
 
 // Sends this node to main, and updates parents sending them to statted if
 // necessary
-void finishNode(struct thread_data *T, struct entry *node) {
+static void finishNode(struct thread_data *T, struct entry *node) {
 	uint64_t prev_size = node->size;
 	struct entry *curr = node->parent;
 	stack_push(&T->toMain, node, &T->main_blocked, &T->main_sem);
@@ -230,7 +230,7 @@ void finishNode(struct thread_data *T, struct entry *node) {
 	}
 }
 
-void doStat(struct thread_data *T, struct entry *node) {
+static void doStat(struct thread_data *T, struct entry *node) {
 	struct stat sbuf;
 	int result = lstat(node->name, &sbuf);
 
@@ -249,7 +249,7 @@ void doStat(struct thread_data *T, struct entry *node) {
 	}
 }
 
-void doLs(struct thread_data *T, struct entry *node) {
+static void doLs(struct thread_data *T, struct entry *node) {
 	DIR *dirp = opendir(node->name);
 	if (dirp == NULL) {
 		// TODO: error handling
@@ -304,7 +304,7 @@ void doLs(struct thread_data *T, struct entry *node) {
 	}
 }
 
-int thread_func(void *data) {
+static int thread_func(void *data) {
 	// Stopping condition: work queues are empty and all other threads are blocked
 	struct thread_data *T = (struct thread_data*)data;
 
@@ -339,7 +339,7 @@ int thread_func(void *data) {
 	}
 }
 
-void pushHeap(struct entry **heap, int *size, struct entry *node) {
+static void pushHeap(struct entry **heap, int *size, struct entry *node) {
 	if (node == NULL) {
 		return;
 	}
@@ -366,7 +366,7 @@ void pushHeap(struct entry **heap, int *size, struct entry *node) {
 	}
 }
 
-struct entry **traverseDirs(struct entry *root, int *res_size) {
+static struct entry **traverseDirs(struct entry *root, int *res_size) {
 	struct thread_data T = {
 		.toMain = {.head = NULL},
 		.toList = {.head = NULL},
@@ -392,7 +392,7 @@ struct entry **traverseDirs(struct entry *root, int *res_size) {
 		thrd_create(&threads[i], thread_func, &T);
 	}
 	int totalPushed = 0;
-
+	sleep(2);
 	while (true) {
 		struct entry *node = stack_pop(&T.toMain);
 		if (node != NULL) {
@@ -459,12 +459,12 @@ static struct {
 	{"34;42", "01;34", "01;32", NULL},
 };
 
-void freeLsColors() {
+static void freeLsColors() {
 	free(color_g.env);
 	free(color_g.exts);
 }
 
-void initLsColors() {
+static void initLsColors() {
 	char *tmp = getenv("LS_COLORS");
 	if (tmp == NULL || *tmp == '\0') {
 		C.color = false;
@@ -533,7 +533,7 @@ void initLsColors() {
 	color_g.num_exts = i;
 }
 
-const char *getColorStr(struct entry *node) {
+static const char *getColorStr(struct entry *node) {
 	if (S_ISDIR(node->st_mode)) {
 		if (node->st_mode & S_IWOTH) {
 			return color_g.special[DIR_OTH_WR];
@@ -560,7 +560,7 @@ const char *getColorStr(struct entry *node) {
 }
 
 // Write a file name, coloring if necessary
-void wrFileName(struct entry *node) {
+static void wrFileName(struct entry *node) {
 	const char *filename = node->name;
 
 	// Good source for ANSI escape codes:
@@ -595,7 +595,7 @@ void wrFileName(struct entry *node) {
 // Rendering functions
 //----------------------------------------------------------
 
-void renderHumanReadable(uint64_t size) {
+static void renderHumanReadable(uint64_t size) {
 	static const char *suffixes = "BKMGTP";
 	// Sizes greater than 1023P are unsupported
 	static const uint64_t maxSize = (uint64_t)1024 * 1024 * 1024 * 1024 * 1024 * 1023;
@@ -632,7 +632,7 @@ void renderHumanReadable(uint64_t size) {
 	wr(finalBuf);
 }
 
-void
+static void
 renderDisplay(struct entry *root, int idx, int depth, int size, struct entry **arr) {
 	// Find children, remove them from the array and sort them
 	int childs = 0;
