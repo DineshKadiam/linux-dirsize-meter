@@ -370,13 +370,16 @@ static void doLs(struct thread_data *T, struct entry *node, void **buffer, uintp
 			}
 
 			size_t fileLen = strlen(dirent->d_name);
-			size_t newLen = node->nameLen + 2 + strlen(dirent->d_name);
+			size_t newLen = node->nameLen + 2 + fileLen;
 			struct entry *tmp = (struct entry*)calloc(1, sizeof(struct entry) + newLen);
 
 			memcpy(tmp->name, node->name, node->nameLen);
-			tmp->name[node->nameLen] = '/';
-			memcpy(tmp->name + node->nameLen + 1, dirent->d_name, fileLen);
-			tmp->nameLen = newLen - 1;
+			tmp->nameLen = node->nameLen;
+			// Don't append / to the root
+			if (!(tmp->name[0] == '/' && tmp->name[1] == '\0'))
+				tmp->name[tmp->nameLen++] = '/';
+			memcpy(tmp->name + tmp->nameLen, dirent->d_name, fileLen);
+			tmp->nameLen += fileLen;
 
 			tmp->depth = node->depth + 1;
 			tmp->parent = node;
@@ -873,7 +876,7 @@ renderDisplay(struct entry *root, struct indent_info *stack, int depth, int size
 // Path deduplicator
 //----------------------------------------------------------
 // This function normalizes a path by removing all extraneous . .. and / segments
-static void normalizePath(char *const path) {
+static size_t normalizePath(char *const path) {
 	const bool absolute = path[0] == '/';
 	uintptr_t begin = 0;
 	if (absolute) begin++;
@@ -913,15 +916,14 @@ static void normalizePath(char *const path) {
 				path[write++] = path[read++];
 		}
 	}
+	if (write == 0) path[write++] = '.';
 	path[write] = '\0';
+	return write;
 }
 
 // Returns root node. dirs and files are output args for children of root and potentially root
 static struct entry *
 makeSearchList(int count, char *paths[], struct entry **dirs, struct entry **files, struct hl_table *hl) {
-	// 1. Stat all arguments, and print error if any don't exist
-	// 2. Normalize all into absolute paths and detect prefixes
-	// 3. Store relative normalized paths in entry structs
 	struct entry *root;
 	struct stat sbuf;
 	if (count == 0) {
@@ -933,71 +935,81 @@ makeSearchList(int count, char *paths[], struct entry **dirs, struct entry **fil
 		return root;
 	}
 
+	// This is a special node to represent the grand total
 	const char total[] = "(total)";
 	root = (struct entry*)calloc(1, sizeof(struct entry) + sizeof(total));
 	memcpy(root->name, total, sizeof(total));
 	root->nameLen = sizeof(total) - 1;
 
-	// Find the absolute path for all arguments
-	char **absPaths = (char**)malloc(sizeof(char*) * count);
-	uint64_t *lens = (uint64_t*)malloc(sizeof(uint64_t) * count);
+	// Stat all inputs and get absolute path
+	// If node is NULL then this candidate has been rejected
+	struct candidate {
+		struct entry *node;
+		char *abs;
+		size_t absLen;
+	};
+	struct candidate *const cands = (struct candidate*)malloc(sizeof(struct candidate) * count);
 	for (int i = 0; i < count; i++) {
-		absPaths[i] = realpath(paths[i], NULL);
-		if (absPaths[i] == NULL) {
+		const uintptr_t nameLen = strlen(paths[i]);
+		cands[i].node = (struct entry*)calloc(1, sizeof(struct entry) + nameLen + 2);
+		struct entry *n = cands[i].node;
+		n->parent = root;
+		strcpy(n->name, paths[i]);
+		n->nameLen = normalizePath(n->name);
+
+		// Fill out size-related members
+		if (!statNode(AT_FDCWD, &sbuf, n, hl)) {
+			fprintf(stderr, "Error resolving argument %s: %s\n", paths[i], strerror(errno));
+			free(n);
+			cands[i].node = NULL;
+			continue;
+		}
+		cands[i].abs = realpath(n->name, NULL);
+		if (cands[i].abs == NULL) {
 			fprintf(stderr, "Invalid argument %s: %s\n", paths[i], strerror(errno));
+			free(n);
+			cands[i].node = NULL;
 		} else {
-			lens[i] = strlen(absPaths[i]);
+			cands[i].absLen = strlen(cands[i].abs);
 		}
 	}
 
-	// n^2 algorithm to see if any paths are prefixes of any others
-	struct entry *node;
-	int len;
+	// See if any argument encompasses others
 	for (int i = 0; i < count; i++) {
-		if (absPaths[i] == NULL) continue;
+		const struct candidate *const a = &cands[i];
+		if (a->node == NULL || S_ISLNK(a->node->st_mode))
+			continue;
 		for (int j = 0; j < count; j++) {
-			if (i == j || absPaths[j] == NULL) continue;
-			if (lens[j] > lens[i] || 0 != memcmp(absPaths[i], absPaths[j], lens[j]))
-				continue;
-			// Don't detect 'test' as a prefix of 'testing'
-			if (lens[i] == lens[j] || absPaths[i][lens[j]] == '/') {
-				// j is a prefix of i
-				free(absPaths[i]);
-				absPaths[i] = NULL;
-				lens[i] = 0;
-				goto skip;
+			struct candidate *const b = &cands[j];
+			if (i != j && b->node != NULL && !S_ISLNK(b->node->st_mode)
+					&& a->absLen <= b->absLen
+					&& strncmp(a->abs, b->abs, a->absLen) == 0) {
+				char sep = b->abs[a->absLen];
+				if (sep == '\0' || sep == '/') {
+					// a is a prefix for b
+					free(b->node);
+					b->node = NULL;
+				}
 			}
 		}
-
-		len = strlen(paths[i]);
-		node = (struct entry*)calloc(1, sizeof(struct entry) + len + 1);
-		node->parent = root;
-		node->nameLen = len;
-		memcpy(node->name, paths[i], len);
-
-		// Figure out what list to go in
-		if (!statNode(AT_FDCWD, &sbuf, node, hl)) {
-			fprintf(stderr, "Error resolving argument %s: %s\n", paths[i], strerror(errno));
-			free(node);
-		}
-
-		if (S_ISDIR(sbuf.st_mode)) {
-			root->unsearched_children++;
-			node->next = *dirs;
-			*dirs = node;
-		} else {
-			node->next = *files;
-			*files = node;
-			root->size += node->size;
-		}
-skip:;
 	}
 
+	// Build the dirs and files lists
 	for (int i = 0; i < count; i++) {
-		free(absPaths[i]);
+		if (cands[i].node != NULL) {
+			if (S_ISDIR(cands[i].node->st_mode)) {
+				cands[i].node->next = *dirs;
+				*dirs = cands[i].node;
+				root->unsearched_children++;
+			} else {
+				cands[i].node->next = *files;
+				*files = cands[i].node;
+			}
+		}
+		free(cands[i].abs);
 	}
-	free(absPaths);
-	free(lens);
+	free(cands);
+
 	if (root->unsearched_children == 1 && *files == NULL) {
 		free(root);
 		(*dirs)->parent = NULL;
