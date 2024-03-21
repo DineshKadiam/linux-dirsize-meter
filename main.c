@@ -137,6 +137,70 @@ static bool entryComparator(const struct entry *a, const struct entry *b) {
 }
 
 //----------------------------------------------------------
+// Hard link table
+//----------------------------------------------------------
+
+struct hard_link {
+	dev_t st_dev;
+	ino_t st_ino;
+	bool slotFilled;
+};
+
+struct hl_table {
+	// Open address table with quadratic probing. Max load factor = 2
+	mtx_t lock;
+	struct hard_link *table;
+	uint64_t size;
+	uint64_t count;
+};
+
+// Lock must be held. Returns true iff hard link already in hash table
+static bool hl_insert(struct hl_table *hl, dev_t st_dev, ino_t st_ino) {
+	uint64_t idx = st_ino % hl->size;
+	uint64_t step = 0;
+	while (true) {
+		idx += step;
+		step++;
+		// Truncate
+		idx &= hl->size - 1;
+		if (!hl->table[idx].slotFilled) {
+			hl->table[idx].slotFilled = true;
+			hl->table[idx].st_dev = st_dev;
+			hl->table[idx].st_ino = st_ino;
+			return false;
+		} else if (hl->table[idx].st_dev == st_dev && hl->table[idx].st_ino == st_ino) {
+			return true;
+		}
+	}
+}
+
+// External function. Checks if this link has already been seen, and records it
+static bool hl_already_seen(struct hl_table *hl, dev_t st_dev, ino_t st_ino) {
+	mtx_lock(&hl->lock);
+	if (hl->count + 1 >= hl->size / 2) {
+		// Reallocate
+		uint64_t oldSize = hl->size;
+		struct hard_link *oldTable = hl->table;
+		hl->size *= 2;
+		if (hl->size < 512) hl->size = 512;
+		hl->table = calloc(sizeof(struct hard_link), hl->size);
+		if (oldTable != NULL) {
+			for (uint64_t i = 0; i < oldSize; i++) {
+				if (oldTable[i].slotFilled) {
+					hl_insert(hl, oldTable[i].st_dev, oldTable[i].st_ino);
+				}
+			}
+			free(oldTable);
+		}
+	}
+
+	bool alreadyExist = hl_insert(hl, st_dev, st_ino);
+	if (!alreadyExist) hl->count++;
+	mtx_unlock(&hl->lock);
+	return alreadyExist;
+}
+
+//----------------------------------------------------------
 // Atomic-ish stack
 //----------------------------------------------------------
 
@@ -213,6 +277,7 @@ struct thread_data {
 	struct stack toStat;
 	struct stack toList;
 	struct stack toMain;
+	struct hl_table hl;
 	int num_threads;
 	_Atomic int num_blocked_threads;
 	_Atomic int main_blocked;
@@ -253,6 +318,10 @@ static void doStat(struct thread_data *T, struct entry *node) {
 	if (S_ISDIR(sbuf.st_mode)) {
 		stack_push(&T->toList, node, &T->num_blocked_threads, &T->worker_sem);
 	} else {
+		// Kind of rudimentary. Possible improvement: don't send to toMain at all
+		if (C.dedupHardLinks && sbuf.st_nlink > 1 && hl_already_seen(&T->hl, sbuf.st_dev, sbuf.st_ino)) {
+			node->size = 0;
+		}
 		finishNode(T, node);
 	}
 }
@@ -396,6 +465,7 @@ static struct entry **traverseDirs(struct entry *root, int *res_size) {
 		.toMain = {.head = NULL},
 		.toList = {.head = NULL},
 		.toStat = {.head = NULL},
+		.hl = {.table = NULL, .size = 0, .count = 0},
 		.num_threads = 12,
 		.num_blocked_threads = 0,
 		.main_blocked = 0,
@@ -406,6 +476,7 @@ static struct entry **traverseDirs(struct entry *root, int *res_size) {
 	T.toStat.head = root;
 	sem_init(&T.main_sem, 0, 0);
 	sem_init(&T.worker_sem, 0, 0);
+	mtx_init(&T.hl.lock, mtx_plain);
 
 	int queue_size = 0;
 	struct entry **queue = (struct entry **)malloc(sizeof(struct entry*) * (C.rows + 1));
@@ -453,6 +524,8 @@ static struct entry **traverseDirs(struct entry *root, int *res_size) {
 	stack_free(&T.toList);
 	stack_free(&T.toMain);
 	stack_free(&T.toStat);
+	mtx_destroy(&T.hl.lock);
+	free(T.hl.table);
 	*res_size = queue_size;
 	return queue;
 }
@@ -845,8 +918,6 @@ int main(int argc, char* argv[]) {
 
 // TODO:
 // - Better handling of multiple search directories
-// - Convert to C :)
-// - Hard link deduplication
-// - Custom lock-free stack instead of the locking mess
+// - Make toMain lock-free
 // - Sparse tree
 // - Colored help text
