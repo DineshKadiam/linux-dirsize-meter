@@ -164,6 +164,14 @@ static struct entry *stack_pop(struct stack *s) {
 	return ent;
 }
 
+static struct entry *stack_pop_all(struct stack *s) {
+	mtx_lock(&s->mtx);
+	struct entry *ent = s->head;
+	s->head = NULL;
+	mtx_unlock(&s->mtx);
+	return ent;
+}
+
 static void stack_push_many(
 		struct stack *s,
 		struct entry *node,
@@ -409,12 +417,18 @@ static struct entry **traverseDirs(struct entry *root, int *res_size) {
 		thrd_create(&threads[i], thread_func, &T);
 	}
 	int totalPushed = 0;
+	int numPops = 0;
 	while (true) {
-		struct entry *node = stack_pop(&T.toMain);
-		if (node != NULL) {
-			// Insert into priority "queue"
-			totalPushed++;
-			pushHeap(queue, &queue_size, node);
+		struct entry *list = stack_pop_all(&T.toMain);
+		if (list != NULL) {
+			// Insert into priority queue
+			numPops++;
+			while (list != NULL) {
+				totalPushed++;
+				struct entry *tmp = list;
+				list = list->next;
+				pushHeap(queue, &queue_size, tmp);
+			}
 		} else {
 			atomic_store(&T.main_blocked, 1);
 			if (stack_is_empty(&T.toMain)) {
@@ -427,11 +441,10 @@ static struct entry **traverseDirs(struct entry *root, int *res_size) {
 	}
 
 	printf("total pushed: %i\n", totalPushed);
+	printf("num pops: %i\n", numPops);
+	printf("avg pop len: %f\n", (float)totalPushed / numPops);
 	for (int i = 0; i < T.num_threads; i++) {
 		thrd_join(threads[i], NULL);
-	}
-	if (T.toMain.head != NULL || T.toStat.head != NULL || T.toList.head != NULL) {
-		printf("not done\n");
 	}
 
 	free(threads);
