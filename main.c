@@ -13,6 +13,7 @@
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <threads.h>
 #include <unistd.h>
 
 //----------------------------------------------------------
@@ -185,16 +186,18 @@ struct thread_data {
 // Sends this node to main, and updates parents sending them to statted if
 // necessary
 void finishNode(struct thread_data *T, struct entry *node) {
-	push_entry(node, &T->toMain, &T->main_blocked, &T->main_sem);
+	uint64_t prev_size = node->size;
 	struct entry *curr = node->parent;
+	push_entry(node, &T->toMain, &T->main_blocked, &T->main_sem);
 	while (curr != NULL) {
 		int prev = atomic_fetch_sub(&curr->unsearched_children, 1);
-		curr->size += node->size;
+		curr->size += prev_size;
 		if (prev != 1)
 			return;
-		push_entry(curr, &T->toMain, &T->main_blocked, &T->main_sem);
+		struct entry *tmp = curr;
+		prev_size = tmp->size;
 		curr = curr->parent;
-		node = node->parent;
+		push_entry(tmp, &T->toMain, &T->main_blocked, &T->main_sem);
 	}
 }
 
@@ -204,7 +207,6 @@ void doStat(struct thread_data *T, struct entry *node) {
 
 	if (result == -1) {
 		// TODO: error handling
-		//node->size = -errno;
 		finishNode(T, node);
 		return;
 	}
@@ -280,8 +282,9 @@ void doLs(struct thread_data *T, struct entry *node) {
 	}
 }
 
-void thread_func(struct thread_data *T) {
+int thread_func(void *data) {
 	// Stopping condition: work queues are empty and all other threads are blocked
+	struct thread_data *T = (struct thread_data*)data;
 
 	while (true) {
 		struct entry *node;
@@ -302,59 +305,89 @@ void thread_func(struct thread_data *T) {
 			}
 
 			if (oldBlocked == T->num_threads - 1) {
+				sem_post(&T->main_sem);
 				for (int i = 0; i < T->num_threads; i++) {
 					sem_post(&T->worker_sem);
 				}
-				return;
+				return 0;
 			}
 			sem_wait(&T->worker_sem);
 			if (atomic_load(&T->num_blocked_threads) == T->num_threads)
-				return;
+				return 0;
 			atomic_fetch_sub(&T->num_blocked_threads, 1);
 		}
 	}
 }
 
-// TODO: remove root param
-std::priority_queue<entry*, std::vector<entry*>, decltype(&entryComparator)>
-traverseDirs(std::queue<entry*> &&toSearch, struct entry *root) {
-	// FIXME completely redo
-	struct thread_data T = {
-		.toStat = std::move(toSearch)
-	};
-
-	// Spawn I/O threads
-	const int kNumThreads = 10;
-	std::vector<std::thread> threads;
-	for (int i = 0; i < kNumThreads; i++) {
-		threads.emplace_back(thread_func, &T);
+void pushHeap(struct entry **heap, int *size, struct entry *node) {
+	if (node == NULL) {
+		fprintf(stderr, "err\n");
 	}
-
-	// Queue for the finished entries
-	std::priority_queue<entry*, std::vector<entry*>, decltype(&entryComparator)> q(entryComparator);
-
-	std::unique_lock ul(T.lock);
-	while (T.pendingReqs > 0 || !T.statted.empty() || !T.toList.empty() || !T.toStat.empty()) {
-		if (T.statted.empty())
-			T.wakeMain.wait(ul);
-		while (!T.statted.empty()) {
-			struct entry* node = T.statted.front();
-			T.statted.pop();
-			if (node == root) continue;
-			q.push(node);
-			if (q.size() > C.rows) {
-				free(q.top());
-				q.pop();
+	heap[*size] = node;
+	*size += 1;
+	if (*size == C.rows + 1) {
+		int minIdx = 0;
+		for (int i = 0; i < *size; i++) {
+			if (entryComparator(heap[minIdx], heap[i])) {
+				minIdx = i;
 			}
 		}
+		free(heap[minIdx]);
+		heap[minIdx] = heap[*size - 1];
+		*size -= 1;
 	}
-	ul.unlock();
-	
-	T.wakeThreads.notify_all();
-	for (size_t i = 0; i < threads.size(); i++) {
-		threads[i].join();
+}
+
+struct entry **traverseDirs(struct entry *root, int *res_size) {
+	struct thread_data T = {
+		.toStat = root,
+		.toList = NULL,
+		.toMain = NULL,
+		.num_threads = 100,
+		.num_blocked_threads = 0,
+		.main_blocked = 0,
+	};
+	sem_init(&T.main_sem, 0, 0);
+	sem_init(&T.worker_sem, 0, 0);
+
+	int queue_size = 0;
+	struct entry **queue = (struct entry **)malloc(sizeof(struct entry*) * (C.rows + 1));
+
+	// Spawn I/O threads
+	thrd_t *threads = malloc(sizeof(thrd_t) * T.num_threads);
+	for (int i = 0; i < T.num_threads; i++) {
+		// TODO error handling
+		thrd_create(&threads[i], thread_func, &T);
 	}
-	return q;
+
+	while (true) {
+		struct entry *node = atomic_load(&T.toMain);
+		if (node != NULL) {
+			if (!atomic_compare_exchange_weak(&T.toMain, &node, node->next))
+				continue;
+			// Insert into priority "queue"
+			pushHeap(queue, &queue_size, node);
+		} else {
+			atomic_store(&T.main_blocked, 1);
+			int num_blocked = atomic_load(&T.num_blocked_threads);
+			if (atomic_load(&T.toMain) == NULL) {
+				if (num_blocked == T.num_threads)
+					break;
+				sem_wait(&T.main_sem);
+			}
+			atomic_store(&T.main_blocked, 0);
+		}
+	}
+
+	for (int i = 0; i < T.num_threads; i++) {
+		thrd_join(threads[i], NULL);
+	}
+
+	free(threads);
+	sem_destroy(&T.main_sem);
+	sem_destroy(&T.worker_sem);
+	*res_size = queue_size;
+	return queue;
 }
 
 //----------------------------------------------------------
@@ -693,7 +726,6 @@ int main(int argc, char* argv[]) {
 	}
 
 	struct entry *root;
-	std::queue<entry*> toStat;
 	// Gather search paths
 	// TODO: Error message improvement
 	if (optind == argc) {
@@ -701,13 +733,11 @@ int main(int argc, char* argv[]) {
 		root->name[0] = '.';
 		root->name[1] = '\0';
 		root->nameLen = 1;
-		toStat.push(root);
 	} else if (argc - optind == 1) {
 		int len = strlen(argv[optind]);
 		root = (struct entry*)calloc(1, sizeof(struct entry) + len + 1);
 		root->nameLen = len;
 		strcpy(root->name, argv[optind]);
-		toStat.push(root);
 	} else {
 		fprintf(stderr, "Error: Only 1 search path is supported\n");
 		fprintf(stderr, "%s", USAGE);
@@ -718,23 +748,18 @@ int main(int argc, char* argv[]) {
 		initLsColors();
 	}
 
-	std::priority_queue<entry*, std::vector<entry*>, decltype(&entryComparator)>
-		q = traverseDirs(std::move(toStat), root);
 
 	// Dump it into a plain array for processing
 	// Make a tree out of the .parent pointers
 	// Format it somehow
-	struct entry **final_entries = (struct entry**)malloc(sizeof(entry*) * q.size());
-	int size = 0;
-	while (!q.empty()) {
-		final_entries[size] = q.top();
-		q.pop();
-		size++;
-	}
+	int size;
+	struct entry **final_entries = traverseDirs(root, &size);
 
-	renderDisplay(root, 0, 0, size, final_entries);
-	fwrite(displayBuf, 1, displayPos, stdout);
-	fflush(stdout);
+	if (size != 0) {
+		renderDisplay(root, 0, 0, size, final_entries);
+		fwrite(displayBuf, 1, displayPos, stdout);
+		fflush(stdout);
+	}
 
 	// Cleanup
 	for (int i = 0; i < size; i++) {
@@ -742,7 +767,6 @@ int main(int argc, char* argv[]) {
 	}
 	free(final_entries);
 	free(displayBuf);
-	free(root);
 	freeLsColors();
 
 	return 0;
