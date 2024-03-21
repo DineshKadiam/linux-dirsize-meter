@@ -744,16 +744,22 @@ static void renderHumanReadable(uint64_t size) {
 	wr(finalBuf);
 }
 
+struct indent_info {
+	// Idx is the index of current level, with 0 = biggest
+	int idx;
+	int childs;
+};
+
 static void
-renderDisplay(struct entry *root, int idx, int depth, int size, struct entry **arr) {
+renderDisplay(struct entry *root, struct indent_info *stack, int depth, int size, struct entry **arr) {
 	// Find children, remove them from the array and sort them
-	int childs = 0;
+	stack[depth].childs = 0;
 	for (int i = 0; i < size; i++) {
 		if (arr[i]->parent == root) {
-			childs++;
+			stack[depth].childs++;
 		}
 	}
-	struct entry **children = (struct entry**)malloc(sizeof(struct entry*) * childs);
+	struct entry **children = (struct entry**)malloc(sizeof(struct entry*) * stack[depth].childs);
 	int j = 0;
 	for (int i = 0; i < size; i++) {
 		if (arr[i]->parent == root) {
@@ -762,9 +768,10 @@ renderDisplay(struct entry *root, int idx, int depth, int size, struct entry **a
 			j++;
 		}
 	}
+
 	// render children
-	for (j = 0; j < childs; j++) {
-		renderDisplay(children[j], childs - j - 1, depth + 1, size, arr);
+	for (stack[depth].idx = 0; stack[depth].idx < stack[depth].childs; stack[depth].idx++) {
+		renderDisplay(children[stack[depth].idx], stack, depth + 1, size, arr);
 	}
 
 	// render self, starting with size
@@ -778,17 +785,23 @@ renderDisplay(struct entry *root, int idx, int depth, int size, struct entry **a
 	}
 
 	// Indentation
-	while (depth > 1) {
-		wr("|");
-		for (int i = 1; i < C.indentSize; i++) {
+	int i = 0;
+	while (i <= depth - 2) {
+		// Sparse tree. Only put a | if there's stuff after it
+		if (stack[i].idx == 0) {
+			wr(" ");
+		} else {
+			wr("|");
+		}
+		for (int j = 1; j < C.indentSize; j++) {
 			wr(" ");
 		}
-		depth--;
+		i++;
 	}
 
-	// "tree" form
-	if (depth == 1) {
-		if (idx == 0) {
+	// tree form
+	if (depth > 0) {
+		if (stack[depth-1].idx == stack[depth-1].childs - 1) {
 			wr("/- ");
 		} else {
 			wr("|- ");
@@ -916,9 +929,11 @@ int main(int argc, char* argv[]) {
 	struct entry **final_entries = traverseDirs(root, &size);
 
 	if (size != 0) {
-		renderDisplay(root, 0, 0, size, final_entries);
+		struct indent_info *stack = (struct indent_info*)malloc(sizeof(struct indent_info) * (C.maxDepth+1));
+		renderDisplay(root, stack, 0, size, final_entries);
 		fwrite(displayBuf, 1, displayPos, stdout);
 		fflush(stdout);
+		free(stack);
 	}
 
 	// Cleanup
@@ -935,5 +950,4 @@ int main(int argc, char* argv[]) {
 // TODO:
 // - Better handling of multiple search directories
 // - Make toMain lock-free
-// - Sparse tree
 // - Colored help text
