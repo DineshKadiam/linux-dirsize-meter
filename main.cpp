@@ -1,5 +1,7 @@
+#include <asm/termbits.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <dirent.h>
@@ -47,7 +49,7 @@ struct Config {
 
 static struct Config C {
 	.indentSize = 2,
-	.rows = 20, // FIXME
+	.rows = 20,
 	.color = true,
 	.fullPath = false,
 	.dedupHardLinks = true,
@@ -383,6 +385,7 @@ void parseLsColors() {
 	tmp = colors;
 	int i = 0;
 	// inv: tmp points to the first character after a colon
+	// FIXME ugly mess
 	while (*tmp != '\0') {
 		if (*tmp == '*') {
 			tmp++;
@@ -430,7 +433,6 @@ void wrFileName(struct entry *node) {
 		}
 	}
 
-	// name
 	if (!C.fullPath) {
 		// Find out where the last '/' is in the filename
 		const char *tmp = strrchr(filename, '/');
@@ -511,10 +513,19 @@ int main(int argc, char* argv[]) {
 	setvbuf(stdout, NULL, _IONBF, 0);
 
 	// Default options
-	C.color = isatty(STDOUT_FILENO);
+	bool isTty = isatty(STDOUT_FILENO);
+	C.color = isTty;
 	char* no_color = getenv("NO_COLOR");
 	if (no_color != NULL && *no_color != '\0') {
 		C.color = false;
+	}
+
+	// Default size to terminal height - 10
+	if (isTty) {
+		struct winsize ws;
+		ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws);
+		C.rows = ws.ws_row - 10;
+		if (C.rows < 10) C.rows = 10;
 	}
 
 	// Parse arguments
@@ -626,8 +637,7 @@ int main(int argc, char* argv[]) {
 }
 
 // TODO:
-// - LS_COLORS
+// - LS_COLORS - special file colors
 // - Hard link deduplication
 // - Custom lock-free stack instead of the locking mess
 // - Unicode tree
-// - Detect size of tty
