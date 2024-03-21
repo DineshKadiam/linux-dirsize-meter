@@ -59,7 +59,7 @@ static struct Config C = {
 // All the data about individual files and directories is in this struct
 struct entry {
 	_Atomic uint64_t unsearched_children;
-	uint64_t size;
+	_Atomic uint64_t size;
 	struct entry *parent;
 	struct entry *next; // For use in stacks
 	uint64_t depth;
@@ -190,8 +190,8 @@ void finishNode(struct thread_data *T, struct entry *node) {
 	struct entry *curr = node->parent;
 	push_entry(node, &T->toMain, &T->main_blocked, &T->main_sem);
 	while (curr != NULL) {
-		int prev = atomic_fetch_sub(&curr->unsearched_children, 1);
 		curr->size += prev_size;
+		int prev = atomic_fetch_sub(&curr->unsearched_children, 1);
 		if (prev != 1)
 			return;
 		struct entry *tmp = curr;
@@ -332,7 +332,7 @@ void pushHeap(struct entry **heap, int *size, struct entry *node) {
 				minIdx = i;
 			}
 		}
-		free(heap[minIdx]);
+		//free(heap[minIdx]);
 		heap[minIdx] = heap[*size - 1];
 		*size -= 1;
 	}
@@ -343,7 +343,7 @@ struct entry **traverseDirs(struct entry *root, int *res_size) {
 		.toStat = root,
 		.toList = NULL,
 		.toMain = NULL,
-		.num_threads = 100,
+		.num_threads = 10,
 		.num_blocked_threads = 0,
 		.main_blocked = 0,
 	};
