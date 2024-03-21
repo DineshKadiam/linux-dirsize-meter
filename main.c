@@ -288,22 +288,26 @@ struct thread_data {
 	sem_t main_sem;
 };
 
-// Sends this node to main, and updates parents sending them to statted if
+// Sends this node to main, and updates parents sending them to main as well if
 // necessary
 static void finishNode(struct thread_data *T, struct entry *node) {
+	struct entry *head = node;
+	struct entry **prev_next = &node->next;
 	uint64_t prev_size = node->size;
-	struct entry *curr = node->parent;
-	stack_push(&T->toMain, node, &T->main_blocked, &T->main_sem);
-	while (curr != NULL) {
-		atomic_fetch_add(&curr->size, prev_size);
-		int prev = atomic_fetch_sub(&curr->unsearched_children, 1);
+	node = node->parent;
+	int count = 1;
+	while (node != NULL) {
+		atomic_fetch_add(&node->size, prev_size);
+		int prev = atomic_fetch_sub(&node->unsearched_children, 1);
 		if (prev != 1)
-			return;
-		struct entry *tmp = curr;
-		prev_size = atomic_load(&tmp->size);
-		curr = curr->parent;
-		stack_push(&T->toMain, tmp, &T->main_blocked, &T->main_sem);
+			break;
+		prev_size = atomic_load_explicit(&node->size, memory_order_relaxed);
+		*prev_next = node;
+		prev_next = &node->next;
+		node = node->parent;
+		count++;
 	}
+	stack_push_many(&T->toMain, head, prev_next, count, &T->main_blocked, &T->main_sem);
 }
 
 static void doStat(struct thread_data *T, struct entry *node) {
