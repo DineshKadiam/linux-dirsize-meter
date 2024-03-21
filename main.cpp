@@ -336,22 +336,23 @@ void renderHumanReadable(uint64_t size) {
 		suffix++;
 	}
 
-	// Render the string
-	uint8_t decimal = size % 10;
-	size /= 10;
+	// Render backwards to finalBuf
 	char finalBuf[7] = {0};
-	int len = sprintf(finalBuf, "%" PRIu64, size);
-	if (len <= 2) {
-		finalBuf[len++] = '.';
-		finalBuf[len++] = decimal + '0';
+	int idx = 5;
+	finalBuf[idx--] = ' ';
+	finalBuf[idx--] = *suffix;
+	if (size < 100) {
+		finalBuf[idx--] = size % 10 + '0';
+		finalBuf[idx--] = '.';
 	}
-	finalBuf[len++] = *suffix;
-	finalBuf[len++] = ' ';
+	size /= 10;
 
-	// Pad to 6 characters and write result
-	for (int i = len; i < 6; i++) {
-		wr(" ");
+	// Integer part and padding
+	while (idx >= 0) {
+		finalBuf[idx--] = (size == 0) ? ' ' : (size % 10) + '0';
+		size /= 10;
 	}
+
 	wr(finalBuf);
 }
 
@@ -595,6 +596,9 @@ int main(int argc, char* argv[]) {
 	// TODO: Error message improvement
 	if (optind == argc) {
 		root.name = ".";
+		toStat.push(&root);
+	} else if (argc - optind == 1) {
+		root.name = argv[optind];
 		toStat.push(&root);
 	} else {
 		while (optind < argc) {
