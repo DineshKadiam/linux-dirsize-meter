@@ -325,78 +325,56 @@ static bool statNode(int at_fd, struct stat *sbuf, struct entry *ent, struct hl_
 	return true;
 }
 
-// From getdents(2)
-struct linux_dirent64 {
-	ino64_t        d_ino;    // 64-bit inode number
-	off64_t        d_off;    // 64-bit offset to next structure
-	unsigned short d_reclen; // Size of this dirent
-	unsigned char  d_type;   // File type
-	char           d_name[]; // Filename (null-terminated)
-};
-
 // node MUST be a directory, and size needs to be already filled out
-static void doLs(struct thread_data *T, struct entry *node, void **buffer, uintptr_t *bufferSize) {
-	int fd = open(node->name, O_DIRECTORY | O_CLOEXEC | O_RDONLY); // Add O_NOFOLLOW?
-	if (fd == -1) {
+static void doLs(struct thread_data *T, struct entry *node) {
+	DIR *dir = opendir(node->name);
+	if (dir == NULL) {
 		atomic_store_explicit(&T->encountered_errors, true, memory_order_relaxed);
 		finishNode(T, node);
 		return;
 	}
 
-	// Getdents loop
 	struct entry *head = NULL;
 	while (true) {
-		ssize_t bytesRead = getdents64(fd, *buffer, *bufferSize);
-		if (bytesRead == -1) {
-			if (errno == EINVAL) {
-				// Realloc and try again
-				*bufferSize *= 2;
-				*buffer = realloc(*buffer, *bufferSize);
-				continue;
-			} else {
-				// Actual error
+		// Loop through buffer
+		errno = 0;
+		const struct dirent *dirent = readdir(dir);
+		if (dirent == NULL) {
+			if (errno != 0)
 				atomic_store_explicit(&T->encountered_errors, true, memory_order_relaxed);
-				break;
-			}
-		} else if (bytesRead == 0) {
 			break;
 		}
-
-		// Loop through buffer
-		intptr_t offset = 0;
-		while (offset < bytesRead) {
-			struct linux_dirent64 *dirent = (struct linux_dirent64*)((char*)(*buffer) + offset);
-			offset += dirent->d_reclen;
-			if (strcmp(dirent->d_name, ".") == 0
-					|| strcmp(dirent->d_name, "..") == 0) {
-				continue;
-			}
-
-			size_t fileLen = strlen(dirent->d_name);
-			size_t newLen = node->nameLen + 2 + fileLen;
-			struct entry *tmp = (struct entry*)calloc(1, sizeof(struct entry) + newLen);
-
-			memcpy(tmp->name, node->name, node->nameLen);
-			tmp->nameLen = node->nameLen;
-			// Don't append / to the root
-			if (!(tmp->name[0] == '/' && tmp->name[1] == '\0'))
-				tmp->name[tmp->nameLen++] = '/';
-			memcpy(tmp->name + tmp->nameLen, dirent->d_name, fileLen);
-			tmp->nameLen += fileLen;
-
-			tmp->depth = node->depth + 1;
-			tmp->parent = node;
-
-			tmp->next = head;
-			head = tmp;
+		if (strcmp(dirent->d_name, ".") == 0
+				|| strcmp(dirent->d_name, "..") == 0) {
+			continue;
 		}
+
+		size_t fileLen = strlen(dirent->d_name);
+		size_t newLen = node->nameLen + 2 + fileLen;
+		struct entry *tmp = (struct entry*)calloc(1, sizeof(struct entry) + newLen);
+
+		memcpy(tmp->name, node->name, node->nameLen);
+		tmp->nameLen = node->nameLen;
+		// Don't append / to the root
+		if (!(tmp->name[0] == '/' && tmp->name[1] == '\0'))
+			tmp->name[tmp->nameLen++] = '/';
+		memcpy(tmp->name + tmp->nameLen, dirent->d_name, fileLen);
+		tmp->nameLen += fileLen;
+		tmp->depth = node->depth + 1;
+		tmp->parent = node;
+
+		tmp->next = head;
+		head = tmp;
 	}
 
 	// fstatat loop
+	int fd = dirfd(dir);
+	if (fd == -1) fd = AT_FDCWD;
+
 	struct entry *dirs = NULL;
-	struct entry **dirsLastPtr = NULL;
+	struct entry **dirsLastPtr = &dirs;
 	struct entry *files = NULL;
-	struct entry **filesLastPtr = NULL;
+	struct entry **filesLastPtr = &files;
 	uint64_t children = 0;
 	while (head != NULL) {
 		struct entry *tmp = head;
@@ -411,24 +389,16 @@ static void doLs(struct thread_data *T, struct entry *node, void **buffer, uintp
 		}
 
 		if (S_ISDIR(sbuf.st_mode)) {
-			if (dirs == NULL) {
-				dirs = tmp;
-			} else {
-				*dirsLastPtr = tmp;
-			}
+			*dirsLastPtr = tmp;
 			dirsLastPtr = &tmp->next;
 			children++;
 		} else {
-			if (files == NULL) {
-				files = tmp;
-			} else {
-				*filesLastPtr = tmp;
-			}
+			*filesLastPtr = tmp;
 			filesLastPtr = &tmp->next;
 			node->size += tmp->size; // optimize?
 		}
 	}
-	close(fd);
+	closedir(dir);
 
 	// deal with output
 	atomic_store(&node->unsearched_children, children);
@@ -450,13 +420,11 @@ static void doLs(struct thread_data *T, struct entry *node, void **buffer, uintp
 static int thread_func(void *data) {
 	// Stopping condition: work queues are empty and all other threads are blocked
 	struct thread_data *T = (struct thread_data*)data;
-	uintptr_t bufferSize = 16384;
-	void *buffer = malloc(bufferSize);
 
 	while (true) {
 		struct entry *node;
 		if (NULL != (node = stack_pop(&T->toList))) {
-			doLs(T, node, &buffer, &bufferSize);
+			doLs(T, node);
 			continue;
 		}
 
@@ -472,12 +440,10 @@ static int thread_func(void *data) {
 			for (int i = 0; i < C.threads; i++) {
 				sem_post(&T->worker_sem);
 			}
-			free(buffer);
 			return 0;
 		}
 		sem_wait(&T->worker_sem);
 		if (atomic_load(&T->num_blocked_threads) == C.threads) {
-			free(buffer);
 			return 0;
 		}
 		atomic_fetch_sub(&T->num_blocked_threads, 1);
