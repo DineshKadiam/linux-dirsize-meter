@@ -13,23 +13,40 @@
 #include <condition_variable>
 #include <thread>
 
-enum options {
-	NOCOLOR,
-};
-
-struct option opts[] = {
-	{"nocolor", no_argument, nullptr, NOCOLOR},
-	{nullptr, 0, nullptr, 0},
-};
-
 const char* USAGE =
 "Usage: du [OPTIONS]... [path]...\n"
 "Default search path is '.'\n"
+"Useful environment variables:\n"
+"\tNO_COLOR: set to any non-empty value to disable colorized output\n"
 "Options:\n"
-"\t--nocolor: disable colorized output\n";
+"\t-c: disable colorized output\n"
+"\t-C: enable colorized output (default for tty)\n"
+"\t-F: don't truncate file paths\n"
+"\t-l: count every instance of a hard link\n"
+"\t-s: use size of files instead of size on disk\n"
+"\t-b: show sizes in plain bytes instead of human readable\n"
+"\t-i <n>: number of spaces for each level of indentation (default 2)\n"
+"\t-n <n>: number of rows to show (default is terminal size - 10)\n"
+"\t-h: show this help message\n";
 
 struct Config {
-	bool nocolor;
+	int indentSize;
+	int rows;
+	bool color;
+	bool fullPath;
+	bool dedupHardLinks;
+	bool fileLength;
+	bool humanReadable;
+};
+
+static struct Config C {
+	.indentSize = 2,
+	.rows = 20, // FIXME
+	.color = true,
+	.fullPath = false,
+	.dedupHardLinks = true,
+	.fileLength = false,
+	.humanReadable = true,
 };
 
 struct entry {
@@ -99,8 +116,6 @@ void thread_func(struct thread_data *T) {
 			}
 
 			node->size = 512 * sbuf.st_blocks;
-			//fprintf(stderr, "%s: %i\n", node->name.c_str(), node->size);
-
 			if (S_ISDIR(sbuf.st_mode)) {
 				T->toList.push(node);
 				T->wakeThreads.notify_all();
@@ -117,7 +132,6 @@ void thread_func(struct thread_data *T) {
 			T->pendingReqs++;
 			T->toList.pop();
 			ul.unlock();
-			//fprintf(stderr, "%s\n", node->name.c_str());
 
 			DIR *dirp = opendir(node->name.c_str());
 			if (dirp == nullptr) {
@@ -161,7 +175,6 @@ void thread_func(struct thread_data *T) {
 				node->unsearched_children = tmpNodes.size();
 
 				for (size_t i = 0; i < tmpNodes.size(); i++) {
-					//fprintf(stderr, "%s\n", tmpNodes[i]->name.c_str());
 					T->toStat.push(tmpNodes[i]);
 				}
 				tmpNodes.clear();
@@ -213,7 +226,6 @@ traverseDirs(std::queue<entry*> &&toSearch, struct entry *root) {
 	}
 
 	// Queue for the finished entries
-	const int kQueueSize = 50;
 	std::priority_queue<entry*, std::vector<entry*>, decltype(&entryComparator)> q(entryComparator);
 
 	std::unique_lock ul(T.lock);
@@ -225,7 +237,7 @@ traverseDirs(std::queue<entry*> &&toSearch, struct entry *root) {
 			T.statted.pop();
 			if (node == root) continue;
 			q.push(node);
-			if (q.size() > kQueueSize) {
+			if (q.size() > C.rows) {
 				delete q.top();
 				q.pop();
 			}
@@ -250,7 +262,7 @@ size_t calcBufSize(struct entry *root, int depth, int size, struct entry **arr) 
 	bufSize += root->name.size();
 	bufSize += 1; // newline
 	bufSize += 5; // Size
-	bufSize += depth * 2 + 1; // FIXME indentation customization
+	bufSize += depth * C.indentSize + 1; // FIXME indentation customization
 	bufSize += 6 + 4 * 3 + 1; // FIXME color: ESC[38;2 + ;255 * 4 + m
 	bufSize += 4; // Color reset \e[0m
 	return bufSize;
@@ -291,21 +303,23 @@ renderDisplay(struct entry *root, int idx, int depth, int size, struct entry **a
 		}
 	}
 	// render children
-	for (j = 0; j < childs; j++) {
+	for (j = childs - 1; j >= 0; j--) {
 		buf += renderDisplay(children[j], j, depth + 1, size, arr, buf);
 	}
 
 	// render self
 	// TODO print size
 	while (depth > 1) {
-		strcpy(buf, "| ");
-		buf += 2;
+		*buf++ = '|';
+		for (int i = 1; i < C.indentSize; i++) {
+			*buf++ = ' ';
+		}
 		depth--;
 	}
+	*buf = '\0';
 
 	if (depth == 1) {
 		if (idx == 0) {
-			// FIXME showing up at end instead of branching point
 			strcpy(buf, "/- ");
 		} else {
 			strcpy(buf, "|- ");
@@ -313,10 +327,19 @@ renderDisplay(struct entry *root, int idx, int depth, int size, struct entry **a
 		buf += 3;
 	}
 
-	memcpy(buf, root->name.data(), root->name.size());
-	buf += root->name.size();
-	*buf = '\n';
-	buf++;
+	const char *filename = root->name.c_str();
+	if (!C.fullPath) {
+		// Find out where the last '/' is in the filename
+		const char *tmp = strrchr(filename, '/');
+		if (tmp != NULL) {
+			filename = tmp + 1;
+		}
+	}
+	int filenameLen = strlen(filename);
+	memcpy(buf, filename, filenameLen);
+	buf += filenameLen;
+	*buf++ = '\n';
+	*buf = '\0';
 
 	free(children);
 	return buf - oldBuf;
@@ -324,19 +347,44 @@ renderDisplay(struct entry *root, int idx, int depth, int size, struct entry **a
 
 int main(int argc, char* argv[]) {
 	// Default options
-	struct Config config {
-		.nocolor = false,
-	};
+	C.color = isatty(STDOUT_FILENO);
+	char* no_color = getenv("NO_COLOR");
+	if (no_color != NULL && *no_color != '\0') {
+		C.color = false;
+	}
+
+	// Parse arguments
 	while (true) {
-		int c = getopt_long(argc, argv, "", opts, nullptr);
+		int c = getopt(argc, argv, "cCFlbsi:n:h");
 		if (c == -1)
 			break;
 
 		switch (c) {
-			case NOCOLOR:
-				// Set some config option
-				config.nocolor = true;
+			case 'c':
+				C.color = false;
 				break;
+			case 'C':
+				C.color = true;
+				break;
+			case 'F':
+				C.fullPath = true;
+				break;
+			case 'l':
+				C.dedupHardLinks = false;
+				break;
+			case 'b':
+				C.fileLength = true;
+				break;
+			case 's':
+				C.humanReadable = false;
+				break;
+			case 'i':
+				// indentation level
+				break;
+			case 'n':
+				// number of rows
+				break;
+			case 'h':
 			case '?':
 				fprintf(stderr, "%s", USAGE);
 				return 1;
@@ -380,10 +428,6 @@ int main(int argc, char* argv[]) {
 		size++;
 	}
 
-	for (int i = 0; i < size; i++) {
-		printf("%s: %li\n", final_entries[i]->name.c_str(), final_entries[i]->size);
-	}
-
 	// Calculate size of buffer needed
 	size_t bufSize = calcBufSize(&root, 0, size, final_entries);
 	char *displayBuf = (char*)malloc(bufSize);
@@ -393,7 +437,12 @@ int main(int argc, char* argv[]) {
 	fwrite(displayBuf, 1, written, stdout);
 	fflush(stdout);
 
+	// Cleanup
+	for (int i = 0; i < size; i++) {
+		delete final_entries[i];
+	}
 	free(final_entries);
+	free(displayBuf);
 
 	return 0;
 }
@@ -403,3 +452,4 @@ int main(int argc, char* argv[]) {
 // - Option granularity
 // - Human readable numbers
 // - LS_COLORS
+// - Custom lock-free stack instead of the locking mess
