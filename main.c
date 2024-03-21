@@ -872,9 +872,56 @@ renderDisplay(struct entry *root, struct indent_info *stack, int depth, int size
 //----------------------------------------------------------
 // Path deduplicator
 //----------------------------------------------------------
+// This function normalizes a path by removing all extraneous . .. and / segments
+static void normalizePath(char *const path) {
+	const bool absolute = path[0] == '/';
+	uintptr_t begin = 0;
+	if (absolute) begin++;
+	uintptr_t write = begin;
+	uintptr_t read = begin;
+	//inv:
+	//read..end is remaining path
+	//write..read is skipped chars
+	//path..begin is / for absolute or ../../.. for relative
+	//begin..write is relative path with no trailing /
+	while (path[read] != '\0') {
+		if (path[read] == '/') {
+			read++;
+			continue;
+		}
+
+		if (path[read] == '.' && (path[read+1] == '/' || path[read+1] == '\0')) {
+			read++;
+		} else if (path[read] == '.' && path[read+1] == '.'
+				&& (path[read+2] == '/' || path[read+2] == '\0')) {
+			// Handle .. - Go up a directory or add this path..begin segment
+			read += 2;
+			if (!absolute && begin == write) {
+				if (begin != 0) path[begin++] = '/';
+				path[begin++] = '.';
+				path[begin++] = '.';
+				write = begin;
+			} else if (write > begin) {
+				write--;
+				while (write != begin && path[write] != '/')
+					write--;
+			}
+		} else {
+			if (write > 0 && path[write-1] != '/')
+				path[write++] = '/';
+			while (path[read] != '\0' && path[read] != '/')
+				path[write++] = path[read++];
+		}
+	}
+	path[write] = '\0';
+}
+
 // Returns root node. dirs and files are output args for children of root and potentially root
-struct entry *
+static struct entry *
 makeSearchList(int count, char *paths[], struct entry **dirs, struct entry **files, struct hl_table *hl) {
+	// 1. Stat all arguments, and print error if any don't exist
+	// 2. Normalize all into absolute paths and detect prefixes
+	// 3. Store relative normalized paths in entry structs
 	struct entry *root;
 	struct stat sbuf;
 	if (count == 0) {
