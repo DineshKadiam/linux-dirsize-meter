@@ -316,6 +316,172 @@ traverseDirs(std::queue<entry*> &&toSearch, struct entry *root) {
 }
 
 //----------------------------------------------------------
+// LS_COLORS support
+//----------------------------------------------------------
+
+struct ext_color {
+	char *ext;
+	int extLen;
+	char *color;
+};
+
+enum {
+	DIR_OTH_WR,
+	DIRECTORY,
+	EXEC,
+	FILE_DEFAULT,
+	NUM_SPECIAL,
+};
+
+static struct {
+	char *env;
+	uint64_t num_exts;
+	struct ext_color *exts;
+	const char *special[NUM_SPECIAL];
+} color_g = {
+	NULL,
+	0,
+	NULL,
+	// Defaults from ls.c in coreutils, line 616
+	{"34;42", "01;34", "01;32", NULL},
+};
+
+void freeLsColors() {
+	free(color_g.env);
+	free(color_g.exts);
+}
+
+void initLsColors() {
+	char *tmp = getenv("LS_COLORS");
+	if (tmp == NULL || *tmp == '\0') {
+		C.color = false;
+		return;
+	}
+
+	color_g.env = strdup(tmp);
+	int entries = 0;
+	for (int i = 0; color_g.env[i] != '\0'; i++) {
+		if (color_g.env[i] == ':') {
+			entries++;
+		}
+	}
+
+	color_g.exts = (struct ext_color*)malloc(entries * sizeof(struct ext_color));
+
+	// Fill out all the exts structs. In the process, add null terminators
+	// to the end of the color strings so wr() works with them.
+	tmp = color_g.env;
+	int i = 0;
+	// FIXME ugly mess
+	const char *special[] = {"ow", "di", "ex", "fi"};
+	enum {EXT, SPECIAL, CONT, BEGIN} state = BEGIN;
+	for (char *tmp = color_g.env; *tmp != '\0'; tmp++) {
+		if (*tmp == ':') {
+			*tmp = '\0';
+			state = BEGIN;
+			continue;
+		}
+
+		switch (state) {
+		case BEGIN:
+			if (*tmp == '*') {
+				state = EXT;
+				color_g.exts[i].ext = tmp + 1;
+			}
+			else state = SPECIAL;
+			break;
+		case EXT:
+			if (*tmp == '=') {
+				state = CONT;
+				color_g.exts[i].color = tmp + 1;
+				color_g.exts[i].extLen = tmp - color_g.exts[i].ext;
+				i++;
+			}
+			break;
+		case SPECIAL:
+			// 2nd character of match string
+			int j;
+			for (j = 0; j < NUM_SPECIAL; j++) {
+				if (tmp[-1] == special[j][0] && tmp[0] == special[j][1])
+					break;
+			}
+			if (j == NUM_SPECIAL || tmp[1] != '=') {
+				state = CONT;
+				continue;
+			}
+			color_g.special[j] = tmp + 2;
+			state = CONT;
+			break;
+		default:
+			// Do nothing so that * doesn't start a new extension
+			break;
+		}
+	}
+	color_g.num_exts = i;
+}
+
+const char *getColorStr(struct entry *node) {
+	const char *filename = node->name.c_str();
+	const size_t filenameLen = node->name.size();
+
+	if (S_ISDIR(node->st_mode)) {
+		if (node->st_mode & S_IWOTH) {
+			return color_g.special[DIR_OTH_WR];
+		} else {
+			return color_g.special[DIRECTORY];
+		}
+	} else if (S_ISREG(node->st_mode)) {
+		if (node->st_mode & (S_IXOTH | S_IXGRP | S_IXUSR)) {
+			return color_g.special[EXEC];
+		}
+	}
+	for (unsigned int i = 0; i < color_g.num_exts; i++) {
+		size_t extLen = color_g.exts[i].extLen;
+		const char *ext = color_g.exts[i].ext;
+		if (filenameLen >= extLen &&
+		    0 == strncmp(filename + filenameLen - extLen, ext, extLen)) {
+			return color_g.exts[i].color;
+		}
+	}
+
+	if (S_ISREG(node->st_mode))
+		return color_g.special[FILE_DEFAULT];
+	return NULL;
+}
+
+// Write a file name, coloring if necessary
+void wrFileName(struct entry *node) {
+	const char *filename = node->name.c_str();
+
+	// Good source for ANSI escape codes:
+	// https://en.wikipedia.org/wiki/ANSI_escape_code
+	bool needToReset = false;
+	if (C.color) {
+		// Compare st_mode and file suffix with LS_COLORS
+		const char *colStr = getColorStr(node);
+		if (colStr != NULL && colStr[0] != '\0') {
+			wr("\033[");
+			wr(colStr);
+			wr("m");
+			needToReset = true;
+		}
+	}
+
+	if (!C.fullPath) {
+		// Find out where the last '/' is in the filename
+		const char *tmp = strrchr(filename, '/');
+		if (tmp != NULL) {
+			filename = tmp + 1;
+		}
+	}
+	wr(filename);
+
+	if (C.color && needToReset) {
+		wr("\033[0m");
+	}
+}
+
+//----------------------------------------------------------
 // Rendering functions
 //----------------------------------------------------------
 
@@ -354,98 +520,6 @@ void renderHumanReadable(uint64_t size) {
 	}
 
 	wr(finalBuf);
-}
-
-// TODO: special file colors
-char *colors = NULL;
-struct ext_color {
-	char *ext;
-	int extLen;
-	char *color;
-};
-struct ext_color *ext_entries = NULL;
-int num_ext_entries = 0;
-
-void parseLsColors() {
-	char *tmp = getenv("LS_COLORS");
-	if (tmp == NULL || *tmp == '\0')
-		return;
-
-	colors = strdup(tmp);
-	int entries = 0;
-	for (int i = 0; colors[i] != '\0'; i++) {
-		if (colors[i] == ':') {
-			entries++;
-		}
-	}
-
-	ext_entries = (struct ext_color*)malloc(entries * sizeof(struct ext_color));
-
-	// Fill out all the ext_entries structs. In the process, add null terminators
-	// to the end of the color strings so wr() works with them.
-	tmp = colors;
-	int i = 0;
-	// inv: tmp points to the first character after a colon
-	// FIXME ugly mess
-	while (*tmp != '\0') {
-		if (*tmp == '*') {
-			tmp++;
-			if (*tmp == '\0') break;
-
-			ext_entries[i].ext = tmp;
-			while (*tmp != '\0' && *tmp != '=') tmp++;
-			ext_entries[i].extLen = tmp - ext_entries[i].ext;
-
-			if (*tmp == '\0') break;
-			*tmp++ = '\0';
-			if (*tmp == '\0') break;
-			ext_entries[i].color = tmp;
-			i++;
-		}
-		while (*tmp != '\0' && *tmp != ':') tmp++;
-		if (*tmp == ':') {
-			*tmp = '\0';
-			tmp++;
-		}
-	}
-	num_ext_entries = i;
-}
-
-// Write a file name, coloring if necessary
-void wrFileName(struct entry *node) {
-	const char *filename = node->name.c_str();
-	const int filenameLen = node->name.size();
-
-	// Good source for ANSI escape codes:
-	// https://en.wikipedia.org/wiki/ANSI_escape_code
-	bool needToReset = false;
-	if (C.color) {
-		// Compare st_mode and file suffix with LS_COLORS
-		for (int i = 0; i < num_ext_entries; i++) {
-			int extLen = ext_entries[i].extLen;
-			const char *ext = ext_entries[i].ext;
-			if (filenameLen >= extLen &&
-			    0 == strncmp(filename + filenameLen - extLen, ext, extLen)) {
-				wr("\033[");
-				wr(ext_entries[i].color);
-				wr("m");
-				needToReset = true;
-			}
-		}
-	}
-
-	if (!C.fullPath) {
-		// Find out where the last '/' is in the filename
-		const char *tmp = strrchr(filename, '/');
-		if (tmp != NULL) {
-			filename = tmp + 1;
-		}
-	}
-	wr(filename);
-
-	if (C.color && needToReset) {
-		wr("\033[0m");
-	}
 }
 
 void
@@ -579,7 +653,7 @@ int main(int argc, char* argv[]) {
 		return 1;
 	}
 	if (C.color) {
-		parseLsColors();
+		initLsColors();
 	}
 
 	struct entry root = {
@@ -634,14 +708,14 @@ int main(int argc, char* argv[]) {
 	}
 	free(final_entries);
 	free(displayBuf);
-	free(colors);
-	free(ext_entries);
+	freeLsColors();
 
 	return 0;
 }
 
 // TODO:
-// - LS_COLORS - special file colors
+// - Better handling of multiple search directories
+// - Convert to C :)
 // - Hard link deduplication
 // - Custom lock-free stack instead of the locking mess
-// - Unicode tree
+// - Sparse tree
