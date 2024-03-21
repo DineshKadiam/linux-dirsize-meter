@@ -1,20 +1,19 @@
 #include <asm/termbits.h>
+#include <dirent.h>
+#include <errno.h>
+#include <getopt.h>
+#include <inttypes.h>
+#include <semaphore.h>
+#include <stdatomic.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include <stdint.h>
 #include <stdio.h>
-#include <unistd.h>
+#include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <dirent.h>
-#include <getopt.h>
-#include <stdint.h>
-#include <inttypes.h>
-#include <string.h>
-
-#include <queue>
-#include <mutex>
-#include <string>
-#include <condition_variable>
-#include <thread>
+#include <unistd.h>
 
 //----------------------------------------------------------
 // Constants, globals, and structures
@@ -46,7 +45,7 @@ struct Config {
 	bool humanReadable : 1;
 };
 
-static struct Config C {
+static struct Config C = {
 	.indentSize = 2,
 	.rows = 20,
 	.color = true,
@@ -58,9 +57,10 @@ static struct Config C {
 
 // All the data about individual files and directories is in this struct
 struct entry {
-	uint64_t unsearched_children;
+	_Atomic uint64_t unsearched_children;
 	uint64_t size;
-	entry* parent;
+	struct entry *parent;
+	struct entry *next; // For use in stacks
 	uint64_t depth;
 	mode_t st_mode;
 	size_t nameLen; // Does NOT include null terminator!
@@ -138,143 +138,179 @@ bool entryComparator(const struct entry *a, const struct entry *b) {
 //----------------------------------------------------------
 // Traversal code
 //----------------------------------------------------------
+//
+// Atomic stack ops:
+// state: num_blocked_threads, semaphore
+// push:
+//	CAS loop to push on list
+//	semaphore increment num_blocked_threads times
+// pop:
+// 	CAS loop to pop head off list
+// 	if empty, increment num_blocked_threads
+// 	loop:
+// 		check head of list again, goto end if not empty
+// 		wait on semaphore
+// 		goto loop
+// 	end:
+// 		decr num_blocked_threads
+// 		return
+//
+
+void
+push_entry(struct entry *node, struct entry *_Atomic *stack, _Atomic int *blocked_threads, sem_t *sema) {
+	struct entry *old = atomic_load(stack);
+	do {
+		node->next = old;
+	} while (!atomic_compare_exchange_weak(stack, &old, node));
+
+	int blockedCnt = atomic_load(blocked_threads);
+	for (int i = 0; i < blockedCnt; i++) {
+		sem_post(sema);
+	}
+}
 
 // All these queues hold the entry of the file. toStat and toList will
 // have blank size and unsearched_children fields
 struct thread_data {
-	std::queue<entry*> toStat;
-	std::queue<entry*> statted;
-	std::queue<entry*> toList;
-	std::mutex lock;
-	int pendingReqs;
-	std::condition_variable wakeThreads;
-	std::condition_variable wakeMain; // needed
+	struct entry *_Atomic toStat;
+	struct entry *_Atomic toMain;
+	struct entry *_Atomic toList;
+	int num_threads;
+	_Atomic int num_blocked_threads;
+	_Atomic int main_blocked;
+	sem_t worker_sem;
+	sem_t main_sem;
 };
 
-// Sends this node to statted, and updates parents sending them to statted if
+// Sends this node to main, and updates parents sending them to statted if
 // necessary
 void finishNode(struct thread_data *T, struct entry *node) {
-	T->statted.push(node);
+	push_entry(node, &T->toMain, &T->main_blocked, &T->main_sem);
 	struct entry *curr = node->parent;
-	T->wakeMain.notify_all();
-	while (curr != nullptr) {
-		curr->unsearched_children--;
+	while (curr != NULL) {
+		int prev = atomic_fetch_sub(&curr->unsearched_children, 1);
 		curr->size += node->size;
-		if (curr->unsearched_children != 0)
+		if (prev != 1)
 			return;
-		T->statted.push(curr);
+		push_entry(curr, &T->toMain, &T->main_blocked, &T->main_sem);
 		curr = curr->parent;
 		node = node->parent;
 	}
 }
 
+void doStat(struct thread_data *T, struct entry *node) {
+	struct stat sbuf;
+	int result = lstat(node->name, &sbuf);
+
+	if (result == -1) {
+		// TODO: error handling
+		//node->size = -errno;
+		finishNode(T, node);
+		return;
+	}
+
+	node->size = 512 * sbuf.st_blocks;
+	node->st_mode = sbuf.st_mode;
+	if (S_ISDIR(sbuf.st_mode)) {
+		push_entry(node, &T->toList, &T->num_blocked_threads, &T->worker_sem);
+	} else {
+		finishNode(T, node);
+	}
+}
+
+void doLs(struct thread_data *T, struct entry *node) {
+	DIR *dirp = opendir(node->name);
+	if (dirp == NULL) {
+		// TODO: error handling
+		finishNode(T, node);
+		fprintf(stderr, "error opening %s\n", node->name);
+		return;
+	}
+
+	// In progress entries are stored as a linked list
+	struct entry *head = NULL;
+	struct entry **lastNextPtr = NULL;
+	int count = 0;
+	while (true) {
+		errno = 0;
+		struct dirent *dent = readdir(dirp);
+		if (dent == NULL) {
+			if (errno == 0) break;
+			// else error TODO
+			fprintf(stderr, "error reading %s\n", node->name);
+			break;
+		} else if (strcmp(dent->d_name, ".") == 0 ||
+			   strcmp(dent->d_name, "..") == 0) {
+			continue;
+		}
+
+		count++;
+		int fileLen = strlen(dent->d_name);
+		int newLen = fileLen + node->nameLen + 2;
+		struct entry *tmp = (struct entry*)calloc(1, sizeof(struct entry) + newLen);
+
+		memcpy(tmp->name, node->name, node->nameLen);
+		tmp->name[node->nameLen] = '/';
+		memcpy(tmp->name + node->nameLen + 1, dent->d_name, fileLen);
+		tmp->nameLen = newLen - 1;
+
+		tmp->depth = node->depth + 1;
+		tmp->parent = node;
+		if (head == NULL) {
+			head = tmp;
+		} else {
+			*lastNextPtr = tmp;
+		}
+		lastNextPtr = &tmp->next;
+	}
+
+	closedir(dirp);
+	if (head == NULL) {
+		finishNode(T, node);
+	} else {
+		atomic_store(&node->unsearched_children, count);
+		*lastNextPtr = atomic_load(&T->toStat);
+		while (!atomic_compare_exchange_weak(&T->toStat, lastNextPtr, head));
+
+		int numToWake = atomic_load(&T->num_blocked_threads);
+		if (count - 1 < numToWake) numToWake = count - 1;
+		for (int i = 0; i < numToWake; i++) {
+			sem_post(&T->worker_sem);
+		}
+	}
+}
+
 void thread_func(struct thread_data *T) {
-	// Stopping condition: work queues are empty and no pending requests
-	std::unique_lock ul(T->lock);
-	std::vector<entry*> tmpNodes;
+	// Stopping condition: work queues are empty and all other threads are blocked
 
 	while (true) {
-		if (!T->toStat.empty()) {
-			// stat(2) the file/directory
-			// if directory, add to toList
-			// if file, send to statted and decrement parent
-			// if last file in parent to be statted, send it to statted too,
-			// going up the tree
-			struct entry *node = T->toStat.front();
-			T->toStat.pop();
-			struct stat sbuf;
-
-			T->pendingReqs++;
-			ul.unlock();
-			int result = lstat(node->name, &sbuf);
-			ul.lock();
-			T->pendingReqs--;
-
-			if (result == -1) {
-				// TODO: error handling
-				//node->size = -errno;
-				finishNode(T, node);
-				continue;
+		struct entry *node;
+		if (NULL != (node = atomic_load(&T->toStat))) {
+			if (atomic_compare_exchange_weak(&T->toStat, &node, node->next)) {
+				doStat(T, node);
 			}
-
-			node->size = 512 * sbuf.st_blocks;
-			node->st_mode = sbuf.st_mode;
-			if (S_ISDIR(sbuf.st_mode)) {
-				T->toList.push(node);
-				T->wakeThreads.notify_all();
-			} else {
-				finishNode(T, node);
+		} else if (NULL != (node = atomic_load(&T->toList))) {
+			if (atomic_compare_exchange_weak(&T->toList, &node, node->next)) {
+				doLs(T, node);
 			}
-
-		} else if (!T->toList.empty()) {
-			// readdir(3) the directory
-			// make an entry for each child, and put in toStat
-			// fill out unsearched_children
-			// if directory is empty, decrement parent and send to statted
-			struct entry *node = T->toList.front();
-			T->pendingReqs++;
-			T->toList.pop();
-			ul.unlock();
-
-			DIR *dirp = opendir(node->name);
-			if (dirp == nullptr) {
-				// TODO: error handling
-				ul.lock();
-				T->pendingReqs--;
-				finishNode(T, node);
-				fprintf(stderr, "error opening %s\n", node->name);
-				continue;
-			}
-			
-			while (true) {
-				errno = 0;
-				struct dirent *dent = readdir(dirp);
-				if (dent == nullptr) {
-					if (errno == 0) break;
-					// else error TODO
-					fprintf(stderr, "error reading %s\n", node->name);
-					break;
-				} else if (strcmp(dent->d_name, ".") == 0 ||
-					   strcmp(dent->d_name, "..") == 0) {
-					continue;
-				}
-
-				int fileLen = strlen(dent->d_name);
-				int newLen = fileLen + node->nameLen + 2;
-
-				struct entry *tmp = (struct entry*)calloc(1, sizeof(struct entry) + newLen);
-				tmp->size = 0;
-				memcpy(tmp->name, node->name, node->nameLen);
-				tmp->name[node->nameLen] = '/';
-				memcpy(tmp->name + node->nameLen + 1, dent->d_name, fileLen);
-				tmp->nameLen = newLen - 1;
-				tmp->depth = node->depth + 1;
-				tmp->parent = node;
-				tmpNodes.push_back(tmp);
-			}
-
-			closedir(dirp);
-			ul.lock();
-			T->pendingReqs--;
-			if (tmpNodes.empty()) {
-				finishNode(T, node);
-			} else {
-				// add all nodes to toStat
-				node->unsearched_children = tmpNodes.size();
-
-				for (size_t i = 0; i < tmpNodes.size(); i++) {
-					T->toStat.push(tmpNodes[i]);
-				}
-				tmpNodes.clear();
-				T->wakeThreads.notify_all();
-			}
-
 		} else {
-			if (T->pendingReqs == 0) {
+			// Block on worker_sem or quit
+			int oldBlocked = atomic_fetch_add(&T->num_blocked_threads, 1);
+			if (atomic_load(&T->toStat) != NULL || atomic_load(&T->toList) != NULL) {
+				atomic_fetch_sub(&T->num_blocked_threads, 1);
+				continue;
+			}
+
+			if (oldBlocked == T->num_threads - 1) {
+				for (int i = 0; i < T->num_threads; i++) {
+					sem_post(&T->worker_sem);
+				}
 				return;
 			}
-
-			T->wakeThreads.wait(ul);
+			sem_wait(&T->worker_sem);
+			if (atomic_load(&T->num_blocked_threads) == T->num_threads)
+				return;
+			atomic_fetch_sub(&T->num_blocked_threads, 1);
 		}
 	}
 }
@@ -282,6 +318,7 @@ void thread_func(struct thread_data *T) {
 // TODO: remove root param
 std::priority_queue<entry*, std::vector<entry*>, decltype(&entryComparator)>
 traverseDirs(std::queue<entry*> &&toSearch, struct entry *root) {
+	// FIXME completely redo
 	struct thread_data T = {
 		.toStat = std::move(toSearch)
 	};
