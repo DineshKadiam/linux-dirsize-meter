@@ -212,29 +212,12 @@ struct stack {
 	mtx_t mtx;
 };
 
-static void stack_init(struct stack *s) {
-	s->head = NULL;
-	mtx_init(&s->mtx, mtx_plain);
-}
-
-static void stack_free(struct stack *s) {
-	mtx_destroy(&s->mtx);
-}
-
 static struct entry *stack_pop(struct stack *s) {
 	mtx_lock(&s->mtx);
 	struct entry *ent = s->head;
 	if (ent != NULL) {
 		s->head = s->head->next;
 	}
-	mtx_unlock(&s->mtx);
-	return ent;
-}
-
-static struct entry *stack_pop_all(struct stack *s) {
-	mtx_lock(&s->mtx);
-	struct entry *ent = s->head;
-	s->head = NULL;
 	mtx_unlock(&s->mtx);
 	return ent;
 }
@@ -279,7 +262,7 @@ static bool stack_is_empty(struct stack *s) {
 struct thread_data {
 	struct stack toStat;
 	struct stack toList;
-	struct stack toMain;
+	struct entry *_Atomic toMain;
 	struct hl_table hl;
 	int num_threads;
 	_Atomic int num_blocked_threads;
@@ -296,6 +279,7 @@ static void finishNode(struct thread_data *T, struct entry *node) {
 	uint64_t prev_size = node->size;
 	node = node->parent;
 	int count = 1;
+	// Build a list of all nodes to send to main
 	while (node != NULL) {
 		atomic_fetch_add(&node->size, prev_size);
 		int prev = atomic_fetch_sub(&node->unsearched_children, 1);
@@ -307,7 +291,10 @@ static void finishNode(struct thread_data *T, struct entry *node) {
 		node = node->parent;
 		count++;
 	}
-	stack_push_many(&T->toMain, head, prev_next, count, &T->main_blocked, &T->main_sem);
+	*prev_next = atomic_load(&T->toMain);
+	while (!atomic_compare_exchange_weak(&T->toMain, prev_next, head));
+	if (atomic_load(&T->main_blocked))
+		sem_post(&T->main_sem);
 }
 
 static void doStat(struct thread_data *T, struct entry *node) {
@@ -473,17 +460,16 @@ static void pushHeap(struct entry **heap, int *size, struct entry *node) {
 
 static struct entry **traverseDirs(struct entry *root, int *res_size) {
 	struct thread_data T = {
-		.toMain = {.head = NULL},
+		.toMain = NULL,
 		.toList = {.head = NULL},
 		.toStat = {.head = NULL},
 		.hl = {.table = NULL, .size = 0, .count = 0},
-		.num_threads = 12,
+		.num_threads = 11,
 		.num_blocked_threads = 0,
 		.main_blocked = 0,
 	};
-	stack_init(&T.toList);
-	stack_init(&T.toStat);
-	stack_init(&T.toMain);
+	mtx_init(&T.toList.mtx, mtx_plain);
+	mtx_init(&T.toStat.mtx, mtx_plain);
 	T.toStat.head = root;
 	sem_init(&T.main_sem, 0, 0);
 	sem_init(&T.worker_sem, 0, 0);
@@ -498,37 +484,32 @@ static struct entry **traverseDirs(struct entry *root, int *res_size) {
 		// TODO error handling
 		thrd_create(&threads[i], thread_func, &T);
 	}
-	int totalPushed = 0;
-	int numPops = 0;
-	// TODO: cleanup
+
 	while (true) {
-		struct entry *list = stack_pop_all(&T.toMain);
-		if (list != NULL) {
-			// Insert into priority queue
-			numPops++;
-			while (list != NULL) {
-				totalPushed++;
-				struct entry *tmp = list;
-				list = list->next;
-				if (tmp->depth <= (unsigned)C.maxDepth)
-					pushHeap(queue, &queue_size, tmp);
-				else
-					free(tmp);
-			}
-		} else {
+		struct entry *list = atomic_exchange(&T.toMain, NULL);
+		if (list == NULL) {
 			atomic_store(&T.main_blocked, 1);
-			if (stack_is_empty(&T.toMain)) {
+			// Have to recheck the stack to prevent deadlock
+			if (atomic_load(&T.toMain) == NULL) {
+				// When every thread is blocked, they all exit
 				if (atomic_load(&T.num_blocked_threads) == T.num_threads)
 					break;
 				sem_wait(&T.main_sem);
 			}
 			atomic_store(&T.main_blocked, 0);
+			continue;
+		}
+		// Insert into priority queue
+		while (list != NULL) {
+			struct entry *tmp = list;
+			list = list->next;
+			if (tmp->depth <= (unsigned)C.maxDepth)
+				pushHeap(queue, &queue_size, tmp);
+			else
+				free(tmp);
 		}
 	}
 
-	printf("total pushed: %i\n", totalPushed);
-	printf("num pops: %i\n", numPops);
-	printf("avg pop len: %f\n", (float)totalPushed / numPops);
 	for (int i = 0; i < T.num_threads; i++) {
 		thrd_join(threads[i], NULL);
 	}
@@ -536,9 +517,8 @@ static struct entry **traverseDirs(struct entry *root, int *res_size) {
 	free(threads);
 	sem_destroy(&T.main_sem);
 	sem_destroy(&T.worker_sem);
-	stack_free(&T.toList);
-	stack_free(&T.toMain);
-	stack_free(&T.toStat);
+	mtx_destroy(&T.toList.mtx);
+	mtx_destroy(&T.toStat.mtx);
 	mtx_destroy(&T.hl.lock);
 	free(T.hl.table);
 	*res_size = queue_size;
@@ -750,7 +730,7 @@ static void renderHumanReadable(uint64_t size) {
 }
 
 struct indent_info {
-	// Idx is the index of current level, with 0 = biggest
+	// Idx is the index of current node in parent's level. 0 = first thing printed
 	int idx;
 	int childs;
 };
@@ -948,12 +928,10 @@ int main(int argc, char* argv[]) {
 	free(final_entries);
 	free(displayBuf);
 	freeLsColors();
-
 	return 0;
 }
 
 // TODO:
 // - Better handling of multiple search directories
 // - Error handling
-// - Make toMain lock-free
 // - Colored help text
