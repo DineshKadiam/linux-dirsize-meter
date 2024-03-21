@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <getopt.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <semaphore.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -278,7 +279,6 @@ static void finishNode(struct thread_data *T, struct entry *node) {
 	struct entry **prev_next = &node->next;
 	uint64_t prev_size = node->size;
 	node = node->parent;
-	int count = 1;
 	// Build a list of all nodes to send to main
 	while (node != NULL) {
 		atomic_fetch_add(&node->size, prev_size);
@@ -289,7 +289,6 @@ static void finishNode(struct thread_data *T, struct entry *node) {
 		*prev_next = node;
 		prev_next = &node->next;
 		node = node->parent;
-		count++;
 	}
 	*prev_next = atomic_load(&T->toMain);
 	while (!atomic_compare_exchange_weak(&T->toMain, prev_next, head));
@@ -582,6 +581,7 @@ static void initLsColors() {
 	// to the end of the color strings so wr() works with them.
 	tmp = color_g.env;
 	int i = 0;
+	int j = 0;
 	// FIXME ugly mess
 	const char *special[] = {"ow", "di", "ex", "fi"};
 	enum {EXT, SPECIAL, CONT, BEGIN} state = BEGIN;
@@ -610,7 +610,6 @@ static void initLsColors() {
 			break;
 		case SPECIAL:
 			// 2nd character of match string
-			int j;
 			for (j = 0; j < NUM_SPECIAL; j++) {
 				if (tmp[-1] == special[j][0] && tmp[0] == special[j][1])
 					break;
@@ -860,7 +859,7 @@ struct entry *makeSearchList(int count, char *paths[]) {
 		root->unsearched_children++;
 		*prev_next = node;
 		prev_next = &node->next;
-skip:
+skip:;
 	}
 
 	for (int i = 0; i < count; i++) {
