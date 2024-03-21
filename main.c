@@ -137,45 +137,74 @@ bool entryComparator(const struct entry *a, const struct entry *b) {
 }
 
 //----------------------------------------------------------
-// Traversal code
+// Atomic-ish stack
 //----------------------------------------------------------
-//
-// Atomic stack ops:
-// state: num_blocked_threads, semaphore
-// push:
-//	CAS loop to push on list
-//	semaphore increment num_blocked_threads times
-// pop:
-// 	CAS loop to pop head off list
-// 	if empty, increment num_blocked_threads
-// 	loop:
-// 		check head of list again, goto end if not empty
-// 		wait on semaphore
-// 		goto loop
-// 	end:
-// 		decr num_blocked_threads
-// 		return
-//
 
-void
-push_entry(struct entry *node, struct entry *_Atomic *stack, _Atomic int *blocked_threads, sem_t *sema) {
-	struct entry *old = atomic_load(stack);
-	do {
-		node->next = old;
-	} while (!atomic_compare_exchange_weak(stack, &old, node));
+struct stack {
+	struct entry *_Atomic head;
+	mtx_t mtx;
+};
 
-	int blockedCnt = atomic_load(blocked_threads);
-	for (int i = 0; i < blockedCnt; i++) {
+void stack_init(struct stack *s) {
+	s->head = NULL;
+	mtx_init(&s->mtx, mtx_plain);
+}
+
+void stack_free(struct stack *s) {
+	mtx_destroy(&s->mtx);
+}
+
+struct entry *stack_pop(struct stack *s) {
+	mtx_lock(&s->mtx);
+	struct entry *ent = s->head;
+	if (ent != NULL) {
+		s->head = s->head->next;
+	}
+	mtx_unlock(&s->mtx);
+	return ent;
+}
+
+void stack_push_many(
+		struct stack *s,
+		struct entry *node,
+		struct entry **last_next,
+		int num,
+		_Atomic int *num_blocked_threads,
+		sem_t *sema) {
+	mtx_lock(&s->mtx);
+	*last_next = s->head;
+	s->head = node;
+	mtx_unlock(&s->mtx);
+
+	int blocked_threads = atomic_load(num_blocked_threads);
+	if (blocked_threads < num) num = blocked_threads;
+	for (int i = 0; i < num; i++) {
 		sem_post(sema);
 	}
 }
 
+void stack_push(struct stack *s, struct entry *node, _Atomic int *num_blocked_threads, sem_t *sema) {
+	stack_push_many(s, node, &node->next, 1, num_blocked_threads, sema);
+}
+
+bool stack_is_empty(struct stack *s) {
+	mtx_lock(&s->mtx);
+	bool result = s->head == NULL;
+	mtx_unlock(&s->mtx);
+	return result;
+}
+
+
+//----------------------------------------------------------
+// Traversal code
+//----------------------------------------------------------
+
 // All these queues hold the entry of the file. toStat and toList will
 // have blank size and unsearched_children fields
 struct thread_data {
-	struct entry *_Atomic toStat;
-	struct entry *_Atomic toMain;
-	struct entry *_Atomic toList;
+	struct stack toStat;
+	struct stack toList;
+	struct stack toMain;
 	int num_threads;
 	_Atomic int num_blocked_threads;
 	_Atomic int main_blocked;
@@ -188,7 +217,7 @@ struct thread_data {
 void finishNode(struct thread_data *T, struct entry *node) {
 	uint64_t prev_size = node->size;
 	struct entry *curr = node->parent;
-	push_entry(node, &T->toMain, &T->main_blocked, &T->main_sem);
+	stack_push(&T->toMain, node, &T->main_blocked, &T->main_sem);
 	while (curr != NULL) {
 		curr->size += prev_size;
 		int prev = atomic_fetch_sub(&curr->unsearched_children, 1);
@@ -197,7 +226,7 @@ void finishNode(struct thread_data *T, struct entry *node) {
 		struct entry *tmp = curr;
 		prev_size = tmp->size;
 		curr = curr->parent;
-		push_entry(tmp, &T->toMain, &T->main_blocked, &T->main_sem);
+		stack_push(&T->toMain, tmp, &T->main_blocked, &T->main_sem);
 	}
 }
 
@@ -214,7 +243,7 @@ void doStat(struct thread_data *T, struct entry *node) {
 	node->size = 512 * sbuf.st_blocks;
 	node->st_mode = sbuf.st_mode;
 	if (S_ISDIR(sbuf.st_mode)) {
-		push_entry(node, &T->toList, &T->num_blocked_threads, &T->worker_sem);
+		stack_push(&T->toList, node, &T->num_blocked_threads, &T->worker_sem);
 	} else {
 		finishNode(T, node);
 	}
@@ -225,7 +254,7 @@ void doLs(struct thread_data *T, struct entry *node) {
 	if (dirp == NULL) {
 		// TODO: error handling
 		finishNode(T, node);
-		fprintf(stderr, "error opening %s\n", node->name);
+		//fprintf(stderr, "error opening %s\n", node->name);
 		return;
 	}
 
@@ -239,7 +268,7 @@ void doLs(struct thread_data *T, struct entry *node) {
 		if (dent == NULL) {
 			if (errno == 0) break;
 			// else error TODO
-			fprintf(stderr, "error reading %s\n", node->name);
+			//fprintf(stderr, "error reading %s\n", node->name);
 			break;
 		} else if (strcmp(dent->d_name, ".") == 0 ||
 			   strcmp(dent->d_name, "..") == 0) {
@@ -267,18 +296,11 @@ void doLs(struct thread_data *T, struct entry *node) {
 	}
 
 	closedir(dirp);
+	atomic_store(&node->unsearched_children, count);
 	if (head == NULL) {
 		finishNode(T, node);
 	} else {
-		atomic_store(&node->unsearched_children, count);
-		*lastNextPtr = atomic_load(&T->toStat);
-		while (!atomic_compare_exchange_weak(&T->toStat, lastNextPtr, head));
-
-		int numToWake = atomic_load(&T->num_blocked_threads);
-		if (count - 1 < numToWake) numToWake = count - 1;
-		for (int i = 0; i < numToWake; i++) {
-			sem_post(&T->worker_sem);
-		}
+		stack_push_many(&T->toStat, head, lastNextPtr, count, &T->num_blocked_threads, &T->worker_sem);
 	}
 }
 
@@ -288,40 +310,42 @@ int thread_func(void *data) {
 
 	while (true) {
 		struct entry *node;
-		if (NULL != (node = atomic_load(&T->toStat))) {
-			if (atomic_compare_exchange_weak(&T->toStat, &node, node->next)) {
-				doStat(T, node);
-			}
-		} else if (NULL != (node = atomic_load(&T->toList))) {
-			if (atomic_compare_exchange_weak(&T->toList, &node, node->next)) {
-				doLs(T, node);
-			}
-		} else {
-			// Block on worker_sem or quit
-			int oldBlocked = atomic_fetch_add(&T->num_blocked_threads, 1);
-			if (atomic_load(&T->toStat) != NULL || atomic_load(&T->toList) != NULL) {
-				atomic_fetch_sub(&T->num_blocked_threads, 1);
-				continue;
-			}
-
-			if (oldBlocked == T->num_threads - 1) {
-				sem_post(&T->main_sem);
-				for (int i = 0; i < T->num_threads; i++) {
-					sem_post(&T->worker_sem);
-				}
-				return 0;
-			}
-			sem_wait(&T->worker_sem);
-			if (atomic_load(&T->num_blocked_threads) == T->num_threads)
-				return 0;
-			atomic_fetch_sub(&T->num_blocked_threads, 1);
+		if (NULL != (node = stack_pop(&T->toStat))) {
+			doStat(T, node);
+			continue;
+		} else if (NULL != (node = stack_pop(&T->toList))) {
+			doLs(T, node);
+			continue;
 		}
+
+		int oldBlocked = atomic_fetch_add(&T->num_blocked_threads, 1);
+		if (!stack_is_empty(&T->toStat) || !stack_is_empty(&T->toList)) {
+			atomic_fetch_sub(&T->num_blocked_threads, 1);
+			continue;
+		}
+
+		if (oldBlocked == T->num_threads - 1) {
+			// We're the last thread left, so we need to wake everyone up to die
+			sem_post(&T->main_sem);
+			for (int i = 0; i < T->num_threads; i++) {
+				sem_post(&T->worker_sem);
+			}
+			return 0;
+		}
+		sem_wait(&T->worker_sem);
+		if (atomic_load(&T->num_blocked_threads) == T->num_threads)
+			return 0;
+		atomic_fetch_sub(&T->num_blocked_threads, 1);
 	}
 }
 
 void pushHeap(struct entry **heap, int *size, struct entry *node) {
 	if (node == NULL) {
-		fprintf(stderr, "err\n");
+		return;
+	}
+	if (strcmp("../school", node->name) == 0) {
+		// test
+		printf("err\n");
 	}
 	heap[*size] = node;
 	*size += 1;
@@ -332,7 +356,11 @@ void pushHeap(struct entry **heap, int *size, struct entry *node) {
 				minIdx = i;
 			}
 		}
-		//free(heap[minIdx]);
+		if (strcmp("../school", heap[minIdx]->name) == 0) {
+			// test
+			printf("err2\n");
+		}
+		free(heap[minIdx]);
 		heap[minIdx] = heap[*size - 1];
 		*size -= 1;
 	}
@@ -340,13 +368,17 @@ void pushHeap(struct entry **heap, int *size, struct entry *node) {
 
 struct entry **traverseDirs(struct entry *root, int *res_size) {
 	struct thread_data T = {
-		.toStat = root,
-		.toList = NULL,
-		.toMain = NULL,
-		.num_threads = 10,
+		.toMain = {.head = NULL},
+		.toList = {.head = NULL},
+		.toStat = {.head = NULL},
+		.num_threads = 12,
 		.num_blocked_threads = 0,
 		.main_blocked = 0,
 	};
+	stack_init(&T.toList);
+	stack_init(&T.toStat);
+	stack_init(&T.toMain);
+	T.toStat.head = root;
 	sem_init(&T.main_sem, 0, 0);
 	sem_init(&T.worker_sem, 0, 0);
 
@@ -359,19 +391,18 @@ struct entry **traverseDirs(struct entry *root, int *res_size) {
 		// TODO error handling
 		thrd_create(&threads[i], thread_func, &T);
 	}
+	int totalPushed = 0;
 
 	while (true) {
-		struct entry *node = atomic_load(&T.toMain);
+		struct entry *node = stack_pop(&T.toMain);
 		if (node != NULL) {
-			if (!atomic_compare_exchange_weak(&T.toMain, &node, node->next))
-				continue;
 			// Insert into priority "queue"
+			totalPushed++;
 			pushHeap(queue, &queue_size, node);
 		} else {
 			atomic_store(&T.main_blocked, 1);
-			int num_blocked = atomic_load(&T.num_blocked_threads);
-			if (atomic_load(&T.toMain) == NULL) {
-				if (num_blocked == T.num_threads)
+			if (stack_is_empty(&T.toMain)) {
+				if (atomic_load(&T.num_blocked_threads) == T.num_threads)
 					break;
 				sem_wait(&T.main_sem);
 			}
@@ -379,13 +410,20 @@ struct entry **traverseDirs(struct entry *root, int *res_size) {
 		}
 	}
 
+	printf("total pushed: %i\n", totalPushed);
 	for (int i = 0; i < T.num_threads; i++) {
 		thrd_join(threads[i], NULL);
+	}
+	if (T.toMain.head != NULL || T.toStat.head != NULL || T.toList.head != NULL) {
+		printf("not done\n");
 	}
 
 	free(threads);
 	sem_destroy(&T.main_sem);
 	sem_destroy(&T.worker_sem);
+	stack_free(&T.toList);
+	stack_free(&T.toMain);
+	stack_free(&T.toStat);
 	*res_size = queue_size;
 	return queue;
 }
