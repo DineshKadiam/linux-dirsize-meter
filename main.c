@@ -36,6 +36,7 @@ const char* USAGE =
 "\t-l: count every instance of a hard link\n"
 "\t-s: use size of files instead of size on disk\n"
 "\t-b: show sizes in plain bytes instead of human readable\n"
+"\t-p: display full path of files in the tree\n"
 "\t-d <n>: depth limit to show in output\n"
 "\t-i <n>: number of spaces for each level of indentation (default 2)\n"
 "\t-n <n>: number of rows to show (default is terminal size - 10)\n"
@@ -51,6 +52,7 @@ struct Config {
 	bool dedupHardLinks : 1;
 	bool fileLength : 1;
 	bool humanReadable : 1;
+	bool fullPath : 1;
 };
 
 static struct Config C = {
@@ -62,6 +64,7 @@ static struct Config C = {
 	.dedupHardLinks = true,
 	.fileLength = false,
 	.humanReadable = true,
+	.fullPath = false,
 };
 
 // All the data about individual files and directories is in this struct
@@ -745,9 +748,11 @@ static void wrFileName(struct entry *node) {
 	}
 
 	// Find out where the last '/' is in the filename
-	const char *tmp = strrchr(filename, '/');
-	if (tmp != NULL) {
-		filename = tmp + 1;
+	if (!C.fullPath) {
+		const char *tmp = strrchr(filename, '/');
+		if (tmp != NULL) {
+			filename = tmp + 1;
+		}
 	}
 	wr(filename);
 
@@ -1053,7 +1058,7 @@ int main(int argc, char* argv[]) {
 	fillOutDefaults();
 	bool argErrors = false;
 	while (true) {
-		int c = getopt(argc, argv, "cClbsi:n:d:t:h");
+		int c = getopt(argc, argv, "cClbpsi:n:d:t:h");
 		if (c == -1)
 			break;
 
@@ -1072,6 +1077,9 @@ int main(int argc, char* argv[]) {
 			break;
 		case 'b':
 			C.humanReadable = false;
+			break;
+		case 'p':
+			C.fullPath = true;
 			break;
 		case 'i':
 			// indentation level
