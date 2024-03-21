@@ -28,6 +28,7 @@ const char* USAGE =
 "Options:\n"
 "\t-c: disable colorized output\n"
 "\t-C: enable colorized output (default for tty)\n"
+"\t-d: depth limit to show in output\n"
 "\t-F: don't truncate file paths\n"
 "\t-l: count every instance of a hard link\n"
 "\t-s: use size of files instead of size on disk\n"
@@ -39,6 +40,7 @@ const char* USAGE =
 struct Config {
 	int indentSize;
 	int rows;
+	int maxDepth;
 	bool color : 1;
 	bool fullPath : 1;
 	bool dedupHardLinks : 1;
@@ -49,6 +51,7 @@ struct Config {
 static struct Config C = {
 	.indentSize = 2,
 	.rows = 20,
+	.maxDepth = 10,
 	.color = true,
 	.fullPath = false,
 	.dedupHardLinks = true,
@@ -292,12 +295,12 @@ static void finishNode(struct thread_data *T, struct entry *node) {
 	struct entry *curr = node->parent;
 	stack_push(&T->toMain, node, &T->main_blocked, &T->main_sem);
 	while (curr != NULL) {
-		curr->size += prev_size;
+		atomic_fetch_add(&curr->size, prev_size);
 		int prev = atomic_fetch_sub(&curr->unsearched_children, 1);
 		if (prev != 1)
 			return;
 		struct entry *tmp = curr;
-		prev_size = tmp->size;
+		prev_size = atomic_load(&tmp->size);
 		curr = curr->parent;
 		stack_push(&T->toMain, tmp, &T->main_blocked, &T->main_sem);
 	}
@@ -498,7 +501,10 @@ static struct entry **traverseDirs(struct entry *root, int *res_size) {
 				totalPushed++;
 				struct entry *tmp = list;
 				list = list->next;
-				pushHeap(queue, &queue_size, tmp);
+				if (tmp->depth <= (unsigned)C.maxDepth)
+					pushHeap(queue, &queue_size, tmp);
+				else
+					free(tmp);
 			}
 		} else {
 			atomic_store(&T.main_blocked, 1);
@@ -818,7 +824,7 @@ int main(int argc, char* argv[]) {
 	// Parse arguments
 	bool argErrors = false;
 	while (true) {
-		int c = getopt(argc, argv, "cCFlbsi:n:h");
+		int c = getopt(argc, argv, "cCFlbsi:n:d:h");
 		if (c == -1)
 			break;
 
@@ -854,6 +860,12 @@ int main(int argc, char* argv[]) {
 			}
 			if (C.rows == 0) {
 				fprintf(stderr, "Error: please specify at least 1 row of output\n");
+				argErrors = true;
+			}
+			break;
+		case 'd':
+			// max depth
+			if (!parseInt(optarg, &C.maxDepth, "max depth")) {
 				argErrors = true;
 			}
 			break;
