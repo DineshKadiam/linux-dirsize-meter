@@ -270,6 +270,7 @@ struct thread_data {
 	struct hl_table hl;
 	_Atomic int num_blocked_threads;
 	_Atomic int main_blocked;
+	_Atomic bool encountered_errors;
 	sem_t worker_sem;
 	sem_t main_sem;
 };
@@ -303,7 +304,7 @@ static void doStat(struct thread_data *T, struct entry *node) {
 	int result = lstat(node->name, &sbuf);
 
 	if (result == -1) {
-		// TODO: error handling
+		atomic_store_explicit(&T->encountered_errors, true, memory_order_relaxed);
 		finishNode(T, node);
 		return;
 	}
@@ -328,9 +329,8 @@ static void doStat(struct thread_data *T, struct entry *node) {
 static void doLs(struct thread_data *T, struct entry *node) {
 	DIR *dirp = opendir(node->name);
 	if (dirp == NULL) {
-		// TODO: error handling
+		atomic_store_explicit(&T->encountered_errors, true, memory_order_relaxed);
 		finishNode(T, node);
-		//fprintf(stderr, "error opening %s\n", node->name);
 		return;
 	}
 
@@ -343,8 +343,7 @@ static void doLs(struct thread_data *T, struct entry *node) {
 		struct dirent *dent = readdir(dirp);
 		if (dent == NULL) {
 			if (errno == 0) break;
-			// else error TODO
-			//fprintf(stderr, "error reading %s\n", node->name);
+			atomic_store_explicit(&T->encountered_errors, true, memory_order_relaxed);
 			break;
 		} else if (strcmp(dent->d_name, ".") == 0 ||
 			   strcmp(dent->d_name, "..") == 0) {
@@ -465,6 +464,7 @@ static struct entry **traverseDirs(struct entry *root, int *res_size) {
 		.toList = {.head = NULL},
 		.toStat = {.head = NULL},
 		.hl = {.table = NULL, .size = 0, .count = 0},
+		.encountered_errors = false,
 		.num_blocked_threads = 0,
 		.main_blocked = 0,
 	};
@@ -481,8 +481,10 @@ static struct entry **traverseDirs(struct entry *root, int *res_size) {
 	// Spawn I/O threads
 	thrd_t *threads = malloc(sizeof(thrd_t) * C.threads);
 	for (int i = 0; i < C.threads; i++) {
-		// TODO error handling
-		thrd_create(&threads[i], thread_func, &T);
+		if (thrd_success != thrd_create(&threads[i], thread_func, &T)) {
+			fprintf(stderr, "Fatal error: unable to create thread\n");
+			abort();
+		}
 	}
 
 	while (true) {
@@ -511,7 +513,12 @@ static struct entry **traverseDirs(struct entry *root, int *res_size) {
 	}
 
 	for (int i = 0; i < C.threads; i++) {
+		// Errors here aren't fatal, so ignore
 		thrd_join(threads[i], NULL);
+	}
+
+	if (T.encountered_errors) {
+		fprintf(stderr, "Encountered errors while searching directories. Reported sizes may be innaccurate.\n");
 	}
 
 	free(threads);
@@ -1015,5 +1022,4 @@ int main(int argc, char* argv[]) {
 }
 
 // TODO:
-// - Error handling
 // - Colored help text
