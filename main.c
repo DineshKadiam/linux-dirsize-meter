@@ -37,7 +37,7 @@
 const char USAGE[] =
 "A disk usage summarizer\n"
 "\n"
-B U "Usage:" R " du [OPTIONS]... [path]...\n"
+B U "Usage:" R " dut [OPTIONS]... [path]...\n"
 "Default search path is '.'\n"
 "\n"
 B U "Useful environment variables:\n" R
