@@ -1,6 +1,7 @@
 #define _XOPEN_SOURCE 500
 #define _GNU_SOURCE
 #include <asm/termbits.h>
+#include <ctype.h>
 #include <dirent.h>
 #include <emmintrin.h>
 #include <errno.h>
@@ -26,23 +27,34 @@
 // Constants, globals, and structures
 //----------------------------------------------------------
 
-const char* USAGE =
-"Usage: du [OPTIONS]... [path]...\n"
+#define R "\033[m"
+#define B "\033[1m"
+#define U "\033[4m"
+#define L "\033[2m"
+#define OPT(flag, desc) B "\t-" flag R ": " desc "\n"
+#define OPTa(flag, desc) B "\t-" flag R ": \033[2m<n>" R ": " desc "\n"
+
+const char USAGE[] =
+"A disk usage summarizer\n"
+"\n"
+B U "Usage:" R " du [OPTIONS]... [path]...\n"
 "Default search path is '.'\n"
-"Useful environment variables:\n"
-"\tNO_COLOR: set to any non-empty value to disable colorized output\n"
-"Options:\n"
-"\t-c: disable colorized output\n"
-"\t-C: enable colorized output (default for tty)\n"
-"\t-l: count every instance of a hard link\n"
-"\t-s: use size of files instead of size on disk\n"
-"\t-b: show sizes in plain bytes instead of human readable\n"
-"\t-p: display full path of files in the tree\n"
-"\t-d <n>: depth limit to show in output\n"
-"\t-i <n>: number of spaces for each level of indentation (default 2)\n"
-"\t-n <n>: number of rows to show (default is terminal size - 10)\n"
-"\t-t <n>: number of threads to use\n"
-"\t-h: show this help message\n";
+"\n"
+B U "Useful environment variables:\n" R
+OPT("NO_COLOR", "set to any non-empty value to disable colorized output")
+"\n"
+B U "Options:\n" R
+OPT("c", "disable colorized output")
+OPT("C", "enable colorized output")
+OPT("l", "count every instance of a hard link")
+OPT("s", "use size of files instead of size on disk")
+OPT("b", "show sizes in plain bytes intead of human readable format")
+OPT("p", "display full path of files in the tree")
+OPTa("d", "depth limit to show in output")
+OPTa("i", "number of spaces for each level of indentation (default 2)")
+OPTa("n", "number of rows to show (default is terminal size - 10)")
+OPTa("t", "number of threads to use")
+OPT("h", "show this help message");
 
 struct Config {
 	int indentSize;
@@ -83,6 +95,27 @@ struct entry {
 //----------------------------------------------------------
 // Utility functions
 //----------------------------------------------------------
+
+static void printUsage() {
+	if (!C.color) {
+		// Strip out all escapes
+		char buf[2048];
+		uintptr_t r = 0;
+		uintptr_t w = 0;
+		while (r < sizeof(USAGE) - 1) {
+			while (USAGE[r] == '\033') {
+				while (!isalpha(USAGE[r]))
+					r++;
+				r++;
+			}
+			buf[w++] = USAGE[r++];
+		}
+		buf[w] = '\0';
+		fprintf(stderr, "%s", buf);
+	} else {
+		fprintf(stderr, "%s", USAGE);
+	}
+}
 
 static char *displayBuf = NULL;
 // Size of stored data (there is no '\0' at the end)
@@ -1109,14 +1142,14 @@ int main(int argc, char* argv[]) {
 			}
 			break;
 		case 'h':
-			fprintf(stderr, "%s", USAGE);
+			printUsage();
 			return 0;
 		case '?':
 			argErrors = true;
 		}
 	}
 	if (argErrors) {
-		fprintf(stderr, "%s", USAGE);
+		printUsage();
 		return 1;
 	}
 
@@ -1160,6 +1193,3 @@ int main(int argc, char* argv[]) {
 	freeLsColors();
 	return 0;
 }
-
-// TODO:
-// - Colored help text
