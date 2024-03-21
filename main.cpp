@@ -42,57 +42,59 @@ struct entry {
 
 // All these queues hold the entry of the file. toStat and toList will
 // have blank size and unsearched_children fields
-std::queue<entry*> toStat;
-std::queue<entry*> statted;
-std::queue<entry*> toList;
-std::mutex lock;
-int pendingReqs;
-std::condition_variable wakeThreads;
-std::condition_variable wakeMain; // needed?
+struct thread_data {
+	std::queue<entry*> toStat;
+	std::queue<entry*> statted;
+	std::queue<entry*> toList;
+	std::mutex lock;
+	int pendingReqs;
+	std::condition_variable wakeThreads;
+	std::condition_variable wakeMain; // needed
+};
 
 // Sends this node to statted, and updates parents sending them to statted if
 // necessary
-void finishNode(struct entry *node) {
-	statted.push(node);
+void finishNode(struct thread_data *T, struct entry *node) {
+	T->statted.push(node);
 	struct entry *curr = node->parent;
-	wakeMain.notify_all();
+	T->wakeMain.notify_all();
 	while (curr != nullptr) {
 		curr->unsearched_children--;
 		curr->size += node->size;
 		if (curr->unsearched_children != 0)
 			return;
-		statted.push(curr);
+		T->statted.push(curr);
 		curr = curr->parent;
 		node = node->parent;
 	}
 }
 
-void thread_func() {
+void thread_func(struct thread_data *T) {
 	// Stopping condition: work queues are empty and no pending requests
-	std::unique_lock ul(lock);
+	std::unique_lock ul(T->lock);
 	std::vector<entry*> tmpNodes;
 
 	while (true) {
-		if (!toStat.empty()) {
+		if (!T->toStat.empty()) {
 			// stat(2) the file/directory
 			// if directory, add to toList
 			// if file, send to statted and decrement parent
 			// if last file in parent to be statted, send it to statted too,
 			// going up the tree
-			struct entry *node = toStat.front();
-			toStat.pop();
+			struct entry *node = T->toStat.front();
+			T->toStat.pop();
 			struct stat sbuf;
 
-			pendingReqs++;
+			T->pendingReqs++;
 			ul.unlock();
 			int result = lstat(node->name.c_str(), &sbuf);
 			ul.lock();
-			pendingReqs--;
+			T->pendingReqs--;
 
 			if (result == -1) {
 				// TODO: error handling
 				//node->size = -errno;
-				finishNode(node);
+				finishNode(T, node);
 				continue;
 			}
 
@@ -100,20 +102,20 @@ void thread_func() {
 			//fprintf(stderr, "%s: %i\n", node->name.c_str(), node->size);
 
 			if (S_ISDIR(sbuf.st_mode)) {
-				toList.push(node);
-				wakeThreads.notify_all();
+				T->toList.push(node);
+				T->wakeThreads.notify_all();
 			} else {
-				finishNode(node);
+				finishNode(T, node);
 			}
 
-		} else if (!toList.empty()) {
+		} else if (!T->toList.empty()) {
 			// readdir(3) the directory
 			// make an entry for each child, and put in toStat
 			// fill out unsearched_children
 			// if directory is empty, decrement parent and send to statted
-			struct entry *node = toList.front();
-			pendingReqs++;
-			toList.pop();
+			struct entry *node = T->toList.front();
+			T->pendingReqs++;
+			T->toList.pop();
 			ul.unlock();
 			//fprintf(stderr, "%s\n", node->name.c_str());
 
@@ -121,8 +123,8 @@ void thread_func() {
 			if (dirp == nullptr) {
 				// TODO: error handling
 				ul.lock();
-				pendingReqs--;
-				finishNode(node);
+				T->pendingReqs--;
+				finishNode(T, node);
 				fprintf(stderr, "error opening %s\n", node->name.c_str());
 				continue;
 			}
@@ -151,34 +153,34 @@ void thread_func() {
 
 			closedir(dirp);
 			ul.lock();
-			pendingReqs--;
+			T->pendingReqs--;
 			if (tmpNodes.empty()) {
-				finishNode(node);
+				finishNode(T, node);
 			} else {
 				// add all nodes to toStat
 				node->unsearched_children = tmpNodes.size();
 
-				for (int i = 0; i < tmpNodes.size(); i++) {
+				for (size_t i = 0; i < tmpNodes.size(); i++) {
 					//fprintf(stderr, "%s\n", tmpNodes[i]->name.c_str());
-					toStat.push(tmpNodes[i]);
+					T->toStat.push(tmpNodes[i]);
 				}
 				tmpNodes.clear();
-				wakeThreads.notify_all();
+				T->wakeThreads.notify_all();
 			}
 
 		} else {
-			if (pendingReqs == 0) {
+			if (T->pendingReqs == 0) {
 				return;
 			}
 
-			wakeThreads.wait(ul);
+			T->wakeThreads.wait(ul);
 		}
 	}
 }
 
 int countSlashes(const std::string &str) {
 	int slashes = 0;
-	for (int i = 0; i < str.length(); i++) {
+	for (size_t i = 0; i < str.length(); i++) {
 		slashes += str[i] == '/';
 	}
 	return slashes;
@@ -194,6 +196,48 @@ bool entryComparator(const struct entry *a, const struct entry *b) {
 		return slashes < 0;
 	}
 	return a->size > b->size;
+}
+
+// TODO: remove root param
+std::priority_queue<entry*, std::vector<entry*>, decltype(&entryComparator)>
+traverseDirs(std::queue<entry*> &&toSearch, struct entry *root) {
+	struct thread_data T = {
+		.toStat = std::move(toSearch)
+	};
+
+	// Spawn I/O threads
+	const int kNumThreads = 10;
+	std::vector<std::thread> threads;
+	for (int i = 0; i < kNumThreads; i++) {
+		threads.emplace_back(thread_func, &T);
+	}
+
+	// Queue for the finished entries
+	const int kQueueSize = 50;
+	std::priority_queue<entry*, std::vector<entry*>, decltype(&entryComparator)> q(entryComparator);
+
+	std::unique_lock ul(T.lock);
+	while (T.pendingReqs > 0 || !T.statted.empty() || !T.toList.empty() || !T.toStat.empty()) {
+		if (T.statted.empty())
+			T.wakeMain.wait(ul);
+		while (!T.statted.empty()) {
+			struct entry* node = T.statted.front();
+			T.statted.pop();
+			if (node == root) continue;
+			q.push(node);
+			if (q.size() > kQueueSize) {
+				delete q.top();
+				q.pop();
+			}
+		}
+	}
+	ul.unlock();
+	
+	T.wakeThreads.notify_all();
+	for (size_t i = 0; i < threads.size(); i++) {
+		threads[i].join();
+	}
+	return q;
 }
 
 int main(int argc, char* argv[]) {
@@ -224,6 +268,7 @@ int main(int argc, char* argv[]) {
 		nullptr,
 	};
 
+	std::queue<entry*> toStat;
 	// Gather search paths
 	// TODO: Error message improvement
 	if (optind == argc) {
@@ -239,41 +284,8 @@ int main(int argc, char* argv[]) {
 		}
 	}
 
-	// Spawn I/O threads
-	const int kNumThreads = 10;
-	std::vector<std::thread> threads;
-	for (int i = 0; i < kNumThreads; i++) {
-		threads.emplace_back(thread_func);
-	}
-
-	// Queue for the finished entries
-	const int kQueueSize = 50;
-	std::priority_queue<entry*, std::vector<entry*>, decltype(&entryComparator)> q(entryComparator);
-
-	std::unique_lock ul(lock);
-	while (pendingReqs > 0 || !statted.empty() || !toList.empty() || !toStat.empty()) {
-		if (statted.empty())
-			wakeMain.wait(ul);
-		while (!statted.empty()) {
-			struct entry* node = statted.front();
-			statted.pop();
-			if (node == &root) continue;
-			q.push(node);
-			if (q.size() > kQueueSize) {
-				delete q.top();
-				q.pop();
-			}
-		}
-	}
-	ul.unlock();
-
-	printf("total: %li\n", root.size);
-
-	// Join threads
-	wakeThreads.notify_all();
-	for (int i = 0; i < threads.size(); i++) {
-		threads[i].join();
-	}
+	std::priority_queue<entry*, std::vector<entry*>, decltype(&entryComparator)>
+		q = traverseDirs(std::move(toStat), &root);
 
 	// Print out the queue
 	while (!q.empty()) {
@@ -289,3 +301,5 @@ int main(int argc, char* argv[]) {
 // TODO:
 // - Display queue as tree
 // - Option granularity
+// - Human readable numbers
+// - LS_COLORS
