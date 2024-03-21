@@ -39,12 +39,11 @@ const char* USAGE =
 struct Config {
 	int indentSize;
 	int rows;
-	// TODO bitfields?
-	bool color;
-	bool fullPath;
-	bool dedupHardLinks;
-	bool fileLength;
-	bool humanReadable;
+	bool color : 1;
+	bool fullPath : 1;
+	bool dedupHardLinks : 1;
+	bool fileLength : 1;
+	bool humanReadable : 1;
 };
 
 static struct Config C {
@@ -57,13 +56,15 @@ static struct Config C {
 	.humanReadable = true,
 };
 
+// All the data about individual files and directories is in this struct
 struct entry {
-	std::string name;
 	uint64_t unsearched_children;
 	uint64_t size;
 	entry* parent;
 	uint64_t depth;
 	mode_t st_mode;
+	size_t nameLen; // Does NOT include null terminator!
+	char name[];
 };
 
 //----------------------------------------------------------
@@ -185,7 +186,7 @@ void thread_func(struct thread_data *T) {
 
 			T->pendingReqs++;
 			ul.unlock();
-			int result = lstat(node->name.c_str(), &sbuf);
+			int result = lstat(node->name, &sbuf);
 			ul.lock();
 			T->pendingReqs--;
 
@@ -215,13 +216,13 @@ void thread_func(struct thread_data *T) {
 			T->toList.pop();
 			ul.unlock();
 
-			DIR *dirp = opendir(node->name.c_str());
+			DIR *dirp = opendir(node->name);
 			if (dirp == nullptr) {
 				// TODO: error handling
 				ul.lock();
 				T->pendingReqs--;
 				finishNode(T, node);
-				fprintf(stderr, "error opening %s\n", node->name.c_str());
+				fprintf(stderr, "error opening %s\n", node->name);
 				continue;
 			}
 			
@@ -231,18 +232,22 @@ void thread_func(struct thread_data *T) {
 				if (dent == nullptr) {
 					if (errno == 0) break;
 					// else error TODO
-					fprintf(stderr, "error reading %s\n", node->name.c_str());
+					fprintf(stderr, "error reading %s\n", node->name);
 					break;
 				} else if (strcmp(dent->d_name, ".") == 0 ||
 					   strcmp(dent->d_name, "..") == 0) {
 					continue;
 				}
 
-				struct entry *tmp = new entry;
+				int fileLen = strlen(dent->d_name);
+				int newLen = fileLen + node->nameLen + 2;
+
+				struct entry *tmp = (struct entry*)calloc(1, sizeof(struct entry) + newLen);
 				tmp->size = 0;
-				tmp->name = node->name;
-				tmp->name += '/';
-				tmp->name += dent->d_name;
+				memcpy(tmp->name, node->name, node->nameLen);
+				tmp->name[node->nameLen] = '/';
+				memcpy(tmp->name + node->nameLen + 1, dent->d_name, fileLen);
+				tmp->nameLen = newLen - 1;
 				tmp->depth = node->depth + 1;
 				tmp->parent = node;
 				tmpNodes.push_back(tmp);
@@ -301,7 +306,7 @@ traverseDirs(std::queue<entry*> &&toSearch, struct entry *root) {
 			if (node == root) continue;
 			q.push(node);
 			if (q.size() > C.rows) {
-				delete q.top();
+				free(q.top());
 				q.pop();
 			}
 		}
@@ -421,9 +426,6 @@ void initLsColors() {
 }
 
 const char *getColorStr(struct entry *node) {
-	const char *filename = node->name.c_str();
-	const size_t filenameLen = node->name.size();
-
 	if (S_ISDIR(node->st_mode)) {
 		if (node->st_mode & S_IWOTH) {
 			return color_g.special[DIR_OTH_WR];
@@ -438,8 +440,8 @@ const char *getColorStr(struct entry *node) {
 	for (unsigned int i = 0; i < color_g.num_exts; i++) {
 		size_t extLen = color_g.exts[i].extLen;
 		const char *ext = color_g.exts[i].ext;
-		if (filenameLen >= extLen &&
-		    0 == strncmp(filename + filenameLen - extLen, ext, extLen)) {
+		if (node->nameLen >= extLen &&
+		    0 == strncmp(node->name + node->nameLen - extLen, ext, extLen)) {
 			return color_g.exts[i].color;
 		}
 	}
@@ -451,7 +453,7 @@ const char *getColorStr(struct entry *node) {
 
 // Write a file name, coloring if necessary
 void wrFileName(struct entry *node) {
-	const char *filename = node->name.c_str();
+	const char *filename = node->name;
 
 	// Good source for ANSI escape codes:
 	// https://en.wikipedia.org/wiki/ANSI_escape_code
@@ -652,40 +654,35 @@ int main(int argc, char* argv[]) {
 		fprintf(stderr, "%s", USAGE);
 		return 1;
 	}
-	if (C.color) {
-		initLsColors();
-	}
 
-	struct entry root = {
-		"total",
-		0,
-		0,
-		nullptr,
-		0,
-		0,
-	};
-
+	struct entry *root;
 	std::queue<entry*> toStat;
 	// Gather search paths
 	// TODO: Error message improvement
 	if (optind == argc) {
-		root.name = ".";
-		toStat.push(&root);
+		root = (struct entry*)calloc(1, sizeof(struct entry) + 2);
+		root->name[0] = '.';
+		root->name[1] = '\0';
+		root->nameLen = 1;
+		toStat.push(root);
 	} else if (argc - optind == 1) {
-		root.name = argv[optind];
-		toStat.push(&root);
+		int len = strlen(argv[optind]);
+		root = (struct entry*)calloc(1, sizeof(struct entry) + len + 1);
+		root->nameLen = len;
+		strcpy(root->name, argv[optind]);
+		toStat.push(root);
 	} else {
-		while (optind < argc) {
-			entry *node = new entry;
-			node->name = argv[optind];
-			node->parent = &root;
-			toStat.push(node);
-			optind++;
-		}
+		fprintf(stderr, "Error: Only 1 search path is supported\n");
+		fprintf(stderr, "%s", USAGE);
+		return 1;
+	}
+
+	if (C.color) {
+		initLsColors();
 	}
 
 	std::priority_queue<entry*, std::vector<entry*>, decltype(&entryComparator)>
-		q = traverseDirs(std::move(toStat), &root);
+		q = traverseDirs(std::move(toStat), root);
 
 	// Dump it into a plain array for processing
 	// Make a tree out of the .parent pointers
@@ -698,16 +695,17 @@ int main(int argc, char* argv[]) {
 		size++;
 	}
 
-	renderDisplay(&root, 0, 0, size, final_entries);
+	renderDisplay(root, 0, 0, size, final_entries);
 	fwrite(displayBuf, 1, displayPos, stdout);
 	fflush(stdout);
 
 	// Cleanup
 	for (int i = 0; i < size; i++) {
-		delete final_entries[i];
+		free(final_entries[i]);
 	}
 	free(final_entries);
 	free(displayBuf);
+	free(root);
 	freeLsColors();
 
 	return 0;
@@ -719,3 +717,4 @@ int main(int argc, char* argv[]) {
 // - Hard link deduplication
 // - Custom lock-free stack instead of the locking mess
 // - Sparse tree
+// - Colored help text
