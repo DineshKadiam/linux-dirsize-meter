@@ -28,11 +28,11 @@ const char* USAGE =
 "Options:\n"
 "\t-c: disable colorized output\n"
 "\t-C: enable colorized output (default for tty)\n"
-"\t-d: depth limit to show in output\n"
 "\t-F: don't truncate file paths\n"
 "\t-l: count every instance of a hard link\n"
 "\t-s: use size of files instead of size on disk\n"
 "\t-b: show sizes in plain bytes instead of human readable\n"
+"\t-d <n>: depth limit to show in output\n"
 "\t-i <n>: number of spaces for each level of indentation (default 2)\n"
 "\t-n <n>: number of rows to show (default is terminal size - 10)\n"
 "\t-h: show this help message\n";
@@ -320,8 +320,12 @@ static void doStat(struct thread_data *T, struct entry *node) {
 		return;
 	}
 
-	node->size = 512 * sbuf.st_blocks;
 	node->st_mode = sbuf.st_mode;
+	if (C.fileLength) {
+		node->size = sbuf.st_size;
+	} else {
+		node->size = 512 * sbuf.st_blocks;
+	}
 	if (S_ISDIR(sbuf.st_mode)) {
 		stack_push(&T->toList, node, &T->num_blocked_threads, &T->worker_sem);
 	} else {
@@ -496,6 +500,7 @@ static struct entry **traverseDirs(struct entry *root, int *res_size) {
 	}
 	int totalPushed = 0;
 	int numPops = 0;
+	// TODO: cleanup
 	while (true) {
 		struct entry *list = stack_pop_all(&T.toMain);
 		if (list != NULL) {
@@ -949,5 +954,6 @@ int main(int argc, char* argv[]) {
 
 // TODO:
 // - Better handling of multiple search directories
+// - Error handling
 // - Make toMain lock-free
 // - Colored help text
