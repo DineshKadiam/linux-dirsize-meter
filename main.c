@@ -1,5 +1,6 @@
 #include <asm/termbits.h>
 #include <dirent.h>
+#include <emmintrin.h>
 #include <errno.h>
 #include <getopt.h>
 #include <inttypes.h>
@@ -16,6 +17,8 @@
 #include <sys/types.h>
 #include <threads.h>
 #include <unistd.h>
+
+#include "hl.h"
 
 //----------------------------------------------------------
 // Constants, globals, and structures
@@ -160,10 +163,10 @@ struct hl_table {
 	uint64_t size;
 	uint64_t count;
 };
-
+/*
 // Lock must be held. Returns true iff hard link already in hash table
 static bool hl_insert(struct hl_table *hl, dev_t st_dev, ino_t st_ino) {
-	uint64_t idx = st_ino % hl->size;
+	uint64_t idx = st_ino & (hl->size-1);
 	uint64_t step = 0;
 	while (true) {
 		idx += step;
@@ -185,6 +188,7 @@ static bool hl_insert(struct hl_table *hl, dev_t st_dev, ino_t st_ino) {
 static bool hl_already_seen(struct hl_table *hl, dev_t st_dev, ino_t st_ino) {
 	mtx_lock(&hl->lock);
 	if (hl->count + 1 >= hl->size / 2) {
+		fprintf(stderr, "reallocating hash map\n");
 		// Reallocate
 		uint64_t oldSize = hl->size;
 		struct hard_link *oldTable = hl->table;
@@ -206,7 +210,7 @@ static bool hl_already_seen(struct hl_table *hl, dev_t st_dev, ino_t st_ino) {
 	mtx_unlock(&hl->lock);
 	return alreadyExist;
 }
-
+*/
 //----------------------------------------------------------
 // Atomic-ish stack
 //----------------------------------------------------------
@@ -214,16 +218,39 @@ static bool hl_already_seen(struct hl_table *hl, dev_t st_dev, ino_t st_ino) {
 struct stack {
 	struct entry *_Atomic head;
 	mtx_t mtx;
+	uint64_t padding[8];
+	atomic_bool lock;
+	uint64_t morePadding[8];
 };
 
 static struct entry *stack_pop(struct stack *s) {
-	mtx_lock(&s->mtx);
-	struct entry *ent = s->head;
-	if (ent != NULL) {
-		s->head = s->head->next;
+	//if (mtx_trylock(&s->mtx) != thrd_success) return NULL;
+	const int spin_count = 1;
+	int i = 0;
+	while (i++ < spin_count) {
+		if (!atomic_exchange_explicit(&s->lock, true, memory_order_acquire))
+			goto begin;
+		//_mm_pause();
+		//thrd_yield();
+		continue;
+		while (i++ < spin_count && !atomic_load_explicit(&s->lock, memory_order_relaxed)) {
+			_mm_pause();
+		}
 	}
-	mtx_unlock(&s->mtx);
-	return ent;
+	return NULL;
+	//if (atomic_flag_test_and_set(&s->lock) == true) return NULL;
+begin:;
+	struct entry *newHead;
+	struct entry *currHead = atomic_load(&s->head);
+
+	if (currHead == NULL) goto end;
+	do {
+		newHead = currHead->next;
+	} while (!atomic_compare_exchange_weak(&s->head, &currHead, newHead));
+end:
+	//mtx_unlock(&s->mtx);
+	atomic_store_explicit(&s->lock, false, memory_order_release);
+	return currHead;
 }
 
 static void stack_push_many(
@@ -233,10 +260,8 @@ static void stack_push_many(
 		int num,
 		_Atomic int *num_blocked_threads,
 		sem_t *sema) {
-	mtx_lock(&s->mtx);
-	*last_next = s->head;
-	s->head = node;
-	mtx_unlock(&s->mtx);
+	*last_next = atomic_load(&s->head);
+	while (!atomic_compare_exchange_weak(&s->head, last_next, node));
 
 	int blocked_threads = atomic_load(num_blocked_threads);
 	if (blocked_threads < num) num = blocked_threads;
@@ -250,10 +275,7 @@ static void stack_push(struct stack *s, struct entry *node, _Atomic int *num_blo
 }
 
 static bool stack_is_empty(struct stack *s) {
-	mtx_lock(&s->mtx);
-	bool result = s->head == NULL;
-	mtx_unlock(&s->mtx);
-	return result;
+	return atomic_load_explicit(&s->head, memory_order_relaxed) == NULL;
 }
 
 
@@ -273,6 +295,7 @@ struct thread_data {
 	_Atomic bool encountered_errors;
 	sem_t worker_sem;
 	sem_t main_sem;
+	_Atomic uint64_t links;
 };
 
 // Sends this node to main, and updates parents sending them to main as well if
@@ -315,12 +338,17 @@ static void doStat(struct thread_data *T, struct entry *node) {
 	} else {
 		node->size = 512 * sbuf.st_blocks;
 	}
+
 	if (S_ISDIR(sbuf.st_mode)) {
 		stack_push(&T->toList, node, &T->num_blocked_threads, &T->worker_sem);
 	} else {
 		// Kind of rudimentary. Possible improvement: don't send to toMain at all
-		if (C.dedupHardLinks && sbuf.st_nlink > 1 && hl_already_seen(&T->hl, sbuf.st_dev, sbuf.st_ino)) {
-			node->size = 0;
+		if (C.dedupHardLinks && sbuf.st_nlink > 1) {
+			bool alreadySeen = hl_already_seen(&T->hl, sbuf.st_dev, sbuf.st_ino);
+			if (alreadySeen) {
+				atomic_fetch_add(&T->links, 1);
+				node->size = 0;
+			}
 		}
 		finishNode(T, node);
 	}
@@ -461,12 +489,13 @@ static void pushHeap(struct entry **heap, int *size, struct entry *node) {
 static struct entry **traverseDirs(struct entry *root, int *res_size) {
 	struct thread_data T = {
 		.toMain = NULL,
-		.toList = {.head = NULL},
-		.toStat = {.head = NULL},
-		.hl = {.table = NULL, .size = 0, .count = 0},
+		.toList = {.head = NULL, .lock = false},
+		.toStat = {.head = NULL, .lock = false},
+		.hl = {.table = calloc(sizeof(struct hard_link), 131072), .size = 131072, .count = 0},
 		.encountered_errors = false,
 		.num_blocked_threads = 0,
 		.main_blocked = 0,
+		.links = 0,
 	};
 	mtx_init(&T.toList.mtx, mtx_plain);
 	mtx_init(&T.toStat.mtx, mtx_plain);
@@ -516,6 +545,8 @@ static struct entry **traverseDirs(struct entry *root, int *res_size) {
 		// Errors here aren't fatal, so ignore
 		thrd_join(threads[i], NULL);
 	}
+
+	fprintf(stderr, "hard links: %li/%li\n", T.hl.count, T.links);
 
 	if (T.encountered_errors) {
 		fprintf(stderr, "Encountered errors while searching directories. Reported sizes may be innaccurate.\n");
