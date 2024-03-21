@@ -13,6 +13,10 @@
 #include <condition_variable>
 #include <thread>
 
+//----------------------------------------------------------
+// Constants, globals, and structures
+//----------------------------------------------------------
+
 const char* USAGE =
 "Usage: du [OPTIONS]... [path]...\n"
 "Default search path is '.'\n"
@@ -32,6 +36,7 @@ const char* USAGE =
 struct Config {
 	int indentSize;
 	int rows;
+	// TODO bitfields?
 	bool color;
 	bool fullPath;
 	bool dedupHardLinks;
@@ -56,6 +61,90 @@ struct entry {
 	entry* parent;
 };
 
+//----------------------------------------------------------
+// Utility functions
+//----------------------------------------------------------
+
+char *displayBuf = NULL;
+// Size of stored data (there is no '\0' at the end)
+size_t displayPos = 0;
+// Write the string to the output buffer, reallocating if necessary
+void wr(const char *str) {
+	// Size of allocated buffer
+	static size_t size = 0;
+
+	size_t len = strlen(str);
+	if (displayPos + len > size) {
+		if (size == 0) size = 1024;
+		while (displayPos + len > size) size *= 2;
+		displayBuf = (char*)realloc(displayBuf, size);
+	}
+	memcpy(displayBuf + displayPos, str, len);
+	displayPos += len;
+}
+
+// Parse an int of up to 4 digits, printing an error if necessary
+bool parseInt(const char *input, int *output, const char *paramName) {
+	int len = strlen(input);
+	if (len >= 4) {
+		fprintf(stderr, "Error: specified %s is too large\n", paramName);
+		return false;
+	}
+
+	int res = 0;
+	while (*input != '\0') {
+		if (*input < '0' || *input > '9') {
+			fprintf(stderr, "Error: specified %s is not an integer\n", paramName);
+			return false;
+		}
+		res *= 10;
+		res += *input++ - '0';
+	}
+
+	*output = res;
+	return true;
+}
+
+// Insert entry into sorted array
+void insertSorted(struct entry *thing, int size, struct entry **arr) {
+	int i = size;
+	// Set i to where thing needs to go
+	while (i > 0 && thing->size < arr[i-1]->size) i--;
+	// shift everything up
+	while (i < size) {
+		struct entry *tmp = thing;
+		thing = arr[i];
+		arr[i] = tmp;
+		i++;
+	}
+	// last element
+	arr[i] = thing;
+}
+
+int countSlashes(const std::string &str) {
+	int slashes = 0;
+	for (size_t i = 0; i < str.length(); i++) {
+		slashes += str[i] == '/';
+	}
+	return slashes;
+}
+
+bool entryComparator(const struct entry *a, const struct entry *b) {
+	if (a->size == b->size) {
+		// the "bigger" entry is the one with the shorter path
+		int slashes = countSlashes(a->name) - countSlashes(b->name);
+		if (slashes == 0) {
+			// Figure something out
+			return false;
+		}
+		return slashes < 0;
+	}
+	return a->size > b->size;
+}
+
+//----------------------------------------------------------
+// Traversal code
+//----------------------------------------------------------
 
 // All these queues hold the entry of the file. toStat and toList will
 // have blank size and unsearched_children fields
@@ -191,26 +280,6 @@ void thread_func(struct thread_data *T) {
 	}
 }
 
-int countSlashes(const std::string &str) {
-	int slashes = 0;
-	for (size_t i = 0; i < str.length(); i++) {
-		slashes += str[i] == '/';
-	}
-	return slashes;
-}
-bool entryComparator(const struct entry *a, const struct entry *b) {
-	if (a->size == b->size) {
-		// the "bigger" entry is the one with the shorter path
-		int slashes = countSlashes(a->name) - countSlashes(b->name);
-		if (slashes == 0) {
-			// Figure something out
-			return false;
-		}
-		return slashes < 0;
-	}
-	return a->size > b->size;
-}
-
 // TODO: remove root param
 std::priority_queue<entry*, std::vector<entry*>, decltype(&entryComparator)>
 traverseDirs(std::queue<entry*> &&toSearch, struct entry *root) {
@@ -252,41 +321,13 @@ traverseDirs(std::queue<entry*> &&toSearch, struct entry *root) {
 	return q;
 }
 
-size_t calcBufSize(struct entry *root, int depth, int size, struct entry **arr) {
-	size_t bufSize = 0;
-	for (int i = 0; i < size; i++) {
-		if (arr[i]->parent == root) {
-			bufSize += calcBufSize(arr[i], depth + 1, size, arr);
-		}
-	}
-	bufSize += root->name.size();
-	bufSize += 1; // newline
-	bufSize += 5; // Size
-	bufSize += depth * C.indentSize + 1; // FIXME indentation customization
-	bufSize += 6 + 4 * 3 + 1; // FIXME color: ESC[38;2 + ;255 * 4 + m
-	bufSize += 4; // Color reset \e[0m
-	return bufSize;
-}
+//----------------------------------------------------------
+// Rendering functions
+//----------------------------------------------------------
 
-void insertSorted(struct entry *thing, int size, struct entry **arr) {
-	int i = 0;
-	// Find where it goes
-	while (i < size && thing->size <= arr[i]->size) i++;
-	// shift everything down
-	while (i < size) {
-		struct entry *tmp = thing;
-		thing = arr[i];
-		arr[i] = tmp;
-		i++;
-	}
-	// last element
-	arr[i] = thing;
-}
-
-size_t
-renderDisplay(struct entry *root, int idx, int depth, int size, struct entry **arr, char *buf) {
+void
+renderDisplay(struct entry *root, int idx, int depth, int size, struct entry **arr) {
 	// Find children, remove them from the array and sort them
-	char *oldBuf = buf;
 	int childs = 0;
 	for (int i = 0; i < size; i++) {
 		if (arr[i]->parent == root) {
@@ -303,28 +344,26 @@ renderDisplay(struct entry *root, int idx, int depth, int size, struct entry **a
 		}
 	}
 	// render children
-	for (j = childs - 1; j >= 0; j--) {
-		buf += renderDisplay(children[j], j, depth + 1, size, arr, buf);
+	for (j = 0; j < childs; j++) {
+		renderDisplay(children[j], childs - j - 1, depth + 1, size, arr);
 	}
 
 	// render self
 	// TODO print size
 	while (depth > 1) {
-		*buf++ = '|';
+		wr("|");
 		for (int i = 1; i < C.indentSize; i++) {
-			*buf++ = ' ';
+			wr(" ");
 		}
 		depth--;
 	}
-	*buf = '\0';
 
 	if (depth == 1) {
 		if (idx == 0) {
-			strcpy(buf, "/- ");
+			wr("/- ");
 		} else {
-			strcpy(buf, "|- ");
+			wr("|- ");
 		}
-		buf += 3;
 	}
 
 	const char *filename = root->name.c_str();
@@ -335,15 +374,15 @@ renderDisplay(struct entry *root, int idx, int depth, int size, struct entry **a
 			filename = tmp + 1;
 		}
 	}
-	int filenameLen = strlen(filename);
-	memcpy(buf, filename, filenameLen);
-	buf += filenameLen;
-	*buf++ = '\n';
-	*buf = '\0';
+	wr(filename);
+	wr("\n");
 
 	free(children);
-	return buf - oldBuf;
 }
+
+//----------------------------------------------------------
+// Venerable main
+//----------------------------------------------------------
 
 int main(int argc, char* argv[]) {
 	// Default options
@@ -354,41 +393,53 @@ int main(int argc, char* argv[]) {
 	}
 
 	// Parse arguments
+	bool argErrors = false;
 	while (true) {
 		int c = getopt(argc, argv, "cCFlbsi:n:h");
 		if (c == -1)
 			break;
 
 		switch (c) {
-			case 'c':
-				C.color = false;
-				break;
-			case 'C':
-				C.color = true;
-				break;
-			case 'F':
-				C.fullPath = true;
-				break;
-			case 'l':
-				C.dedupHardLinks = false;
-				break;
-			case 'b':
-				C.fileLength = true;
-				break;
-			case 's':
-				C.humanReadable = false;
-				break;
-			case 'i':
-				// indentation level
-				break;
-			case 'n':
-				// number of rows
-				break;
-			case 'h':
-			case '?':
-				fprintf(stderr, "%s", USAGE);
-				return 1;
+		case 'c':
+			C.color = false;
+			break;
+		case 'C':
+			C.color = true;
+			break;
+		case 'F':
+			C.fullPath = true;
+			break;
+		case 'l':
+			C.dedupHardLinks = false;
+			break;
+		case 'b':
+			C.fileLength = true;
+			break;
+		case 's':
+			C.humanReadable = false;
+			break;
+		case 'i':
+			// indentation level
+			if (!parseInt(optarg, &C.indentSize, "indentation level")) {
+				argErrors = true;
+			}
+			break;
+		case 'n':
+			// number of rows
+			if (!parseInt(optarg, &C.rows, "number of rows")) {
+				argErrors = true;
+			}
+			break;
+		case 'h':
+			fprintf(stderr, "%s", USAGE);
+			return 0;
+		case '?':
+			argErrors = true;
 		}
+	}
+	if (argErrors) {
+		fprintf(stderr, "%s", USAGE);
+		return 1;
 	}
 
 	struct entry root = {
@@ -428,13 +479,9 @@ int main(int argc, char* argv[]) {
 		size++;
 	}
 
-	// Calculate size of buffer needed
-	size_t bufSize = calcBufSize(&root, 0, size, final_entries);
-	char *displayBuf = (char*)malloc(bufSize);
-
-	int written = renderDisplay(&root, 0, 0, size, final_entries, displayBuf);
+	renderDisplay(&root, 0, 0, size, final_entries);
 	// TODO: replace fwrite with write(2) so no line buffering
-	fwrite(displayBuf, 1, written, stdout);
+	fwrite(displayBuf, 1, displayPos, stdout);
 	fflush(stdout);
 
 	// Cleanup
