@@ -9,6 +9,7 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <semaphore.h>
+#include <stdalign.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -267,14 +268,15 @@ static bool stack_is_empty(struct stack *s) {
 // All these queues hold the entry of the file. toStat and toList will
 // have blank size and unsearched_children fields
 struct thread_data {
-	struct stack toList;
-	struct entry *_Atomic toMain;
-	struct hl_table *hl;
-	_Atomic int num_blocked_threads;
-	_Atomic int main_blocked;
-	_Atomic bool encountered_errors;
-	sem_t worker_sem;
-	sem_t main_sem;
+	alignas(64) struct entry *_Atomic toMain;
+	alignas(64) _Atomic int num_blocked_threads;
+	alignas(64) _Atomic int main_blocked;
+	alignas(64) _Atomic bool encountered_errors;
+	alignas(64) sem_t worker_sem;
+	alignas(64) sem_t main_sem;
+	alignas(64) struct stack toList;
+	alignas(64) struct hl_table *hl;
+	alignas(64) _Atomic size_t numDirsScanned;
 };
 
 // Sends this node to main, and updates parents sending them to main as well if
@@ -402,6 +404,7 @@ static void doLs(struct thread_data *T, struct entry *node) {
 
 	// deal with output
 	atomic_store(&node->unsearched_children, children);
+	atomic_fetch_add_explicit(&T->numDirsScanned, 1, memory_order_relaxed);
 	if (dirs != NULL) {
 		stack_push_many(&T->toList, dirs, dirsLastPtr, children, &T->num_blocked_threads, &T->worker_sem);
 	} else {
@@ -494,15 +497,28 @@ static void pushHeap(struct entry **heap, int *size, struct entry *node) {
 	}
 }
 
-static void pushHeapMany(struct entry **heap, int *size, struct entry *nodes) {
+static size_t pushHeapMany(struct entry **heap, int *size, struct entry *nodes) {
+	size_t numDirs = 0;
 	while (nodes != NULL) {
 		struct entry *tmp = nodes;
 		nodes = nodes->next;
+		numDirs += S_ISDIR(tmp->st_mode);
 		if (tmp->depth <= (unsigned)C.maxDepth)
 			pushHeap(heap, size, tmp);
 		else
 			free(tmp);
 	}
+	return numDirs;
+}
+
+static bool prg_update_needed(struct timespec last, struct timespec now) {
+	now.tv_sec -= last.tv_sec;
+	now.tv_nsec -= last.tv_nsec;
+	if (now.tv_nsec < 0) {
+		now.tv_sec--;
+		now.tv_nsec += 1000000000;
+	}
+	return now.tv_sec > 1 || now.tv_nsec > 250000000;
 }
 
 static struct entry **
@@ -514,6 +530,7 @@ traverseDirs(struct entry *dirs, struct entry *files, int *res_size, struct hl_t
 		.encountered_errors = false,
 		.num_blocked_threads = 0,
 		.main_blocked = 0,
+		.numDirsScanned = 0,
 	};
 	sem_init(&T.main_sem, 0, 0);
 	sem_init(&T.worker_sem, 0, 0);
@@ -531,6 +548,10 @@ traverseDirs(struct entry *dirs, struct entry *files, int *res_size, struct hl_t
 		}
 	}
 
+	size_t total_dirs_scanned = 0;
+	struct timespec last_prg_update;
+	clock_gettime(CLOCK_MONOTONIC, &last_prg_update);
+
 	while (true) {
 		struct entry *list = atomic_exchange(&T.toMain, NULL);
 		if (list == NULL) {
@@ -545,8 +566,17 @@ traverseDirs(struct entry *dirs, struct entry *files, int *res_size, struct hl_t
 			atomic_store(&T.main_blocked, 0);
 			continue;
 		}
-		pushHeapMany(queue, &queue_size, list);
+		total_dirs_scanned += pushHeapMany(queue, &queue_size, list);
+		struct timespec now;
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		if (prg_update_needed(last_prg_update, now)) {
+			last_prg_update = now;
+			fprintf(stderr, "\rScanning directories... %li scanned", T.numDirsScanned);
+		}
 	}
+
+	// Erase progress bar
+	fprintf(stderr, "\r\033[K");
 
 	for (int i = 0; i < C.threads; i++) {
 		// Errors here aren't fatal, so ignore
