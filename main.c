@@ -339,30 +339,47 @@ static int thread_func(void *data) {
 	}
 }
 
+// Heap property: Every node in the tree is smaller than either of its children
+//                Tree is as broad and shallow as possible
+static void siftDown(struct entry **heap, int size, int idx) {
+	int l;
+	while ((l = idx * 2 + 1) < size) {
+		int r = l + 1;
+		int smallestChild = l;
+		if (r < size && entryComparator(heap[l], heap[r])) {
+			smallestChild = r;
+		}
+		if (entryComparator(heap[idx], heap[smallestChild])) {
+			struct entry *tmp = heap[idx];
+			heap[idx] = heap[smallestChild];
+			heap[smallestChild] = tmp;
+			idx = smallestChild;
+		} else {
+			return;
+		}
+	}
+}
+
 static void pushHeap(struct entry **heap, int *size, struct entry *node) {
-	if (node == NULL) {
-		return;
-	}
-	if (strcmp("../school", node->name) == 0) {
-		// test
-		printf("err\n");
-	}
-	heap[*size] = node;
-	*size += 1;
-	if (*size == C.rows + 1) {
-		int minIdx = 0;
-		for (int i = 0; i < *size; i++) {
-			if (entryComparator(heap[minIdx], heap[i])) {
-				minIdx = i;
-			}
+	if (*size <= C.rows - 1) {
+		// Don't have enough elements to fill the heap yet
+		heap[*size] = node;
+		*size += 1;
+		if (*size != C.rows) return;
+
+		// Build heap algorithm. See wikipedia.
+		for (int root = *size / 2 - 1; root >= 0; root--) {
+			siftDown(heap, *size, root);
 		}
-		if (strcmp("../school", heap[minIdx]->name) == 0) {
-			// test
-			printf("err2\n");
+	} else {
+		// Don't bother sifting down if node < heap[0]
+		if (entryComparator(node, heap[0])) {
+			free(heap[0]);
+			heap[0] = node;
+			siftDown(heap, *size, 0);
+		} else {
+			free(node);
 		}
-		free(heap[minIdx]);
-		heap[minIdx] = heap[*size - 1];
-		*size -= 1;
 	}
 }
 
@@ -392,7 +409,6 @@ static struct entry **traverseDirs(struct entry *root, int *res_size) {
 		thrd_create(&threads[i], thread_func, &T);
 	}
 	int totalPushed = 0;
-	sleep(2);
 	while (true) {
 		struct entry *node = stack_pop(&T.toMain);
 		if (node != NULL) {
@@ -748,6 +764,10 @@ int main(int argc, char* argv[]) {
 		case 'n':
 			// number of rows
 			if (!parseInt(optarg, &C.rows, "number of rows")) {
+				argErrors = true;
+			}
+			if (C.rows == 0) {
+				fprintf(stderr, "Error: please specify at least 1 row of output\n");
 				argErrors = true;
 			}
 			break;
