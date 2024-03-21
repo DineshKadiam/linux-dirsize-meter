@@ -60,6 +60,8 @@ struct entry {
 	uint64_t unsearched_children;
 	uint64_t size;
 	entry* parent;
+	uint64_t depth;
+	mode_t st_mode;
 };
 
 //----------------------------------------------------------
@@ -122,23 +124,10 @@ void insertSorted(struct entry *thing, int size, struct entry **arr) {
 	arr[i] = thing;
 }
 
-int countSlashes(const std::string &str) {
-	int slashes = 0;
-	for (size_t i = 0; i < str.length(); i++) {
-		slashes += str[i] == '/';
-	}
-	return slashes;
-}
-
 bool entryComparator(const struct entry *a, const struct entry *b) {
 	if (a->size == b->size) {
-		// the "bigger" entry is the one with the shorter path
-		int slashes = countSlashes(a->name) - countSlashes(b->name);
-		if (slashes == 0) {
-			// Figure something out
-			return false;
-		}
-		return slashes < 0;
+		// the "bigger" entry is the one with the smaller depth
+		return a->depth < b->depth;
 	}
 	return a->size > b->size;
 }
@@ -206,6 +195,7 @@ void thread_func(struct thread_data *T) {
 			}
 
 			node->size = 512 * sbuf.st_blocks;
+			node->st_mode = sbuf.st_mode;
 			if (S_ISDIR(sbuf.st_mode)) {
 				T->toList.push(node);
 				T->wakeThreads.notify_all();
@@ -251,6 +241,7 @@ void thread_func(struct thread_data *T) {
 				tmp->name = node->name;
 				tmp->name += '/';
 				tmp->name += dent->d_name;
+				tmp->depth = node->depth + 1;
 				tmp->parent = node;
 				tmpNodes.push_back(tmp);
 			}
@@ -362,6 +353,98 @@ void renderHumanReadable(uint64_t size) {
 	wr(finalBuf);
 }
 
+// TODO: special file colors
+char *colors = NULL;
+struct ext_color {
+	char *ext;
+	int extLen;
+	char *color;
+};
+struct ext_color *ext_entries = NULL;
+int num_ext_entries = 0;
+
+void parseLsColors() {
+	char *tmp = getenv("LS_COLORS");
+	if (tmp == NULL || *tmp == '\0')
+		return;
+
+	colors = strdup(tmp);
+	int entries = 0;
+	for (int i = 0; colors[i] != '\0'; i++) {
+		if (colors[i] == ':') {
+			entries++;
+		}
+	}
+
+	ext_entries = (struct ext_color*)malloc(entries * sizeof(struct ext_color));
+
+	// Fill out all the ext_entries structs. In the process, add null terminators
+	// to the end of the color strings so wr() works with them.
+	tmp = colors;
+	int i = 0;
+	// inv: tmp points to the first character after a colon
+	while (*tmp != '\0') {
+		if (*tmp == '*') {
+			tmp++;
+			if (*tmp == '\0') break;
+
+			ext_entries[i].ext = tmp;
+			while (*tmp != '\0' && *tmp != '=') tmp++;
+			ext_entries[i].extLen = tmp - ext_entries[i].ext;
+
+			if (*tmp == '\0') break;
+			*tmp++ = '\0';
+			if (*tmp == '\0') break;
+			ext_entries[i].color = tmp;
+			i++;
+		}
+		while (*tmp != '\0' && *tmp != ':') tmp++;
+		if (*tmp == ':') {
+			*tmp = '\0';
+			tmp++;
+		}
+	}
+	num_ext_entries = i;
+}
+
+// Write a file name, coloring if necessary
+void wrFileName(struct entry *node) {
+	const char *filename = node->name.c_str();
+	const int filenameLen = node->name.size();
+
+	// Good source for ANSI escape codes:
+	// https://en.wikipedia.org/wiki/ANSI_escape_code
+	bool needToReset = false;
+	if (C.color) {
+		// Compare st_mode and file suffix with LS_COLORS
+		for (int i = 0; i < num_ext_entries; i++) {
+			int extLen = ext_entries[i].extLen;
+			const char *ext = ext_entries[i].ext;
+			if (filenameLen >= extLen &&
+			    0 == strncmp(filename + filenameLen - extLen, ext, extLen)) {
+				wr("\033[");
+				wr(ext_entries[i].color);
+				wr("m");
+				needToReset = true;
+			}
+		}
+	}
+
+	// name
+	if (!C.fullPath) {
+		// Find out where the last '/' is in the filename
+		const char *tmp = strrchr(filename, '/');
+		if (tmp != NULL) {
+			filename = tmp + 1;
+		}
+	}
+	wr(filename);
+
+	if (C.color && needToReset) {
+		wr("\033[0m");
+	}
+}
+
 void
 renderDisplay(struct entry *root, int idx, int depth, int size, struct entry **arr) {
 	// Find children, remove them from the array and sort them
@@ -413,15 +496,7 @@ renderDisplay(struct entry *root, int idx, int depth, int size, struct entry **a
 		}
 	}
 
-	const char *filename = root->name.c_str();
-	if (!C.fullPath) {
-		// Find out where the last '/' is in the filename
-		const char *tmp = strrchr(filename, '/');
-		if (tmp != NULL) {
-			filename = tmp + 1;
-		}
-	}
-	wr(filename);
+	wrFileName(root);
 	wr("\n");
 
 	free(children);
@@ -432,6 +507,9 @@ renderDisplay(struct entry *root, int idx, int depth, int size, struct entry **a
 //----------------------------------------------------------
 
 int main(int argc, char* argv[]) {
+	// This has to be done before any printing
+	setvbuf(stdout, NULL, _IONBF, 0);
+
 	// Default options
 	C.color = isatty(STDOUT_FILENO);
 	char* no_color = getenv("NO_COLOR");
@@ -488,12 +566,17 @@ int main(int argc, char* argv[]) {
 		fprintf(stderr, "%s", USAGE);
 		return 1;
 	}
+	if (C.color) {
+		parseLsColors();
+	}
 
 	struct entry root = {
 		"total",
 		0,
 		0,
 		nullptr,
+		0,
+		0,
 	};
 
 	std::queue<entry*> toStat;
@@ -527,7 +610,6 @@ int main(int argc, char* argv[]) {
 	}
 
 	renderDisplay(&root, 0, 0, size, final_entries);
-	// TODO: replace fwrite with write(2) so no line buffering
 	fwrite(displayBuf, 1, displayPos, stdout);
 	fflush(stdout);
 
@@ -537,12 +619,15 @@ int main(int argc, char* argv[]) {
 	}
 	free(final_entries);
 	free(displayBuf);
+	free(colors);
+	free(ext_entries);
 
 	return 0;
 }
 
 // TODO:
 // - LS_COLORS
+// - Hard link deduplication
 // - Custom lock-free stack instead of the locking mess
 // - Unicode tree
 // - Detect size of tty
