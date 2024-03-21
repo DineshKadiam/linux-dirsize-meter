@@ -1,3 +1,4 @@
+#define _XOPEN_SOURCE 500
 #include <asm/termbits.h>
 #include <dirent.h>
 #include <emmintrin.h>
@@ -18,8 +19,6 @@
 #include <threads.h>
 #include <unistd.h>
 
-#include "hl.h"
-
 //----------------------------------------------------------
 // Constants, globals, and structures
 //----------------------------------------------------------
@@ -32,14 +31,13 @@ const char* USAGE =
 "Options:\n"
 "\t-c: disable colorized output\n"
 "\t-C: enable colorized output (default for tty)\n"
-"\t-F: don't truncate file paths\n"
 "\t-l: count every instance of a hard link\n"
 "\t-s: use size of files instead of size on disk\n"
 "\t-b: show sizes in plain bytes instead of human readable\n"
 "\t-d <n>: depth limit to show in output\n"
 "\t-i <n>: number of spaces for each level of indentation (default 2)\n"
 "\t-n <n>: number of rows to show (default is terminal size - 10)\n"
-"\t-t <n>: number of threads to use"
+"\t-t <n>: number of threads to use\n"
 "\t-h: show this help message\n";
 
 struct Config {
@@ -48,7 +46,6 @@ struct Config {
 	int maxDepth;
 	int threads;
 	bool color : 1;
-	bool fullPath : 1;
 	bool dedupHardLinks : 1;
 	bool fileLength : 1;
 	bool humanReadable : 1;
@@ -60,7 +57,6 @@ static struct Config C = {
 	.maxDepth = 10,
 	.threads = 4,
 	.color = true,
-	.fullPath = false,
 	.dedupHardLinks = true,
 	.fileLength = false,
 	.humanReadable = true,
@@ -163,7 +159,7 @@ struct hl_table {
 	uint64_t size;
 	uint64_t count;
 };
-/*
+
 // Lock must be held. Returns true iff hard link already in hash table
 static bool hl_insert(struct hl_table *hl, dev_t st_dev, ino_t st_ino) {
 	uint64_t idx = st_ino & (hl->size-1);
@@ -210,46 +206,30 @@ static bool hl_already_seen(struct hl_table *hl, dev_t st_dev, ino_t st_ino) {
 	mtx_unlock(&hl->lock);
 	return alreadyExist;
 }
-*/
+
 //----------------------------------------------------------
 // Atomic-ish stack
 //----------------------------------------------------------
 
 struct stack {
 	struct entry *_Atomic head;
-	mtx_t mtx;
 	uint64_t padding[8];
-	atomic_bool lock;
+	atomic_flag lock;
 	uint64_t morePadding[8];
 };
 
 static struct entry *stack_pop(struct stack *s) {
-	//if (mtx_trylock(&s->mtx) != thrd_success) return NULL;
-	const int spin_count = 1;
-	int i = 0;
-	while (i++ < spin_count) {
-		if (!atomic_exchange_explicit(&s->lock, true, memory_order_acquire))
-			goto begin;
-		//_mm_pause();
-		//thrd_yield();
-		continue;
-		while (i++ < spin_count && !atomic_load_explicit(&s->lock, memory_order_relaxed)) {
-			_mm_pause();
-		}
-	}
-	return NULL;
-	//if (atomic_flag_test_and_set(&s->lock) == true) return NULL;
-begin:;
+	if (atomic_flag_test_and_set_explicit(&s->lock, memory_order_acquire))
+		return NULL;
+
 	struct entry *newHead;
 	struct entry *currHead = atomic_load(&s->head);
-
-	if (currHead == NULL) goto end;
 	do {
+		if (currHead == NULL) goto end;
 		newHead = currHead->next;
 	} while (!atomic_compare_exchange_weak(&s->head, &currHead, newHead));
 end:
-	//mtx_unlock(&s->mtx);
-	atomic_store_explicit(&s->lock, false, memory_order_release);
+	atomic_flag_clear_explicit(&s->lock, memory_order_release);
 	return currHead;
 }
 
@@ -268,10 +248,6 @@ static void stack_push_many(
 	for (int i = 0; i < num; i++) {
 		sem_post(sema);
 	}
-}
-
-static void stack_push(struct stack *s, struct entry *node, _Atomic int *num_blocked_threads, sem_t *sema) {
-	stack_push_many(s, node, &node->next, 1, num_blocked_threads, sema);
 }
 
 static bool stack_is_empty(struct stack *s) {
@@ -295,7 +271,6 @@ struct thread_data {
 	_Atomic bool encountered_errors;
 	sem_t worker_sem;
 	sem_t main_sem;
-	_Atomic uint64_t links;
 };
 
 // Sends this node to main, and updates parents sending them to main as well if
@@ -340,15 +315,11 @@ static void doStat(struct thread_data *T, struct entry *node) {
 	}
 
 	if (S_ISDIR(sbuf.st_mode)) {
-		stack_push(&T->toList, node, &T->num_blocked_threads, &T->worker_sem);
+		stack_push_many(&T->toList, node, &node->next, 1, &T->num_blocked_threads, &T->worker_sem);
 	} else {
 		// Kind of rudimentary. Possible improvement: don't send to toMain at all
-		if (C.dedupHardLinks && sbuf.st_nlink > 1) {
-			bool alreadySeen = hl_already_seen(&T->hl, sbuf.st_dev, sbuf.st_ino);
-			if (alreadySeen) {
-				atomic_fetch_add(&T->links, 1);
-				node->size = 0;
-			}
+		if (C.dedupHardLinks && sbuf.st_nlink > 1 && hl_already_seen(&T->hl, sbuf.st_dev, sbuf.st_ino)) {
+			node->size = 0;
 		}
 		finishNode(T, node);
 	}
@@ -489,16 +460,13 @@ static void pushHeap(struct entry **heap, int *size, struct entry *node) {
 static struct entry **traverseDirs(struct entry *root, int *res_size) {
 	struct thread_data T = {
 		.toMain = NULL,
-		.toList = {.head = NULL, .lock = false},
-		.toStat = {.head = NULL, .lock = false},
+		.toList = {.head = NULL, .lock = ATOMIC_FLAG_INIT},
+		.toStat = {.head = NULL, .lock = ATOMIC_FLAG_INIT},
 		.hl = {.table = calloc(sizeof(struct hard_link), 131072), .size = 131072, .count = 0},
 		.encountered_errors = false,
 		.num_blocked_threads = 0,
 		.main_blocked = 0,
-		.links = 0,
 	};
-	mtx_init(&T.toList.mtx, mtx_plain);
-	mtx_init(&T.toStat.mtx, mtx_plain);
 	T.toStat.head = root;
 	sem_init(&T.main_sem, 0, 0);
 	sem_init(&T.worker_sem, 0, 0);
@@ -546,8 +514,6 @@ static struct entry **traverseDirs(struct entry *root, int *res_size) {
 		thrd_join(threads[i], NULL);
 	}
 
-	fprintf(stderr, "hard links: %li/%li\n", T.hl.count, T.links);
-
 	if (T.encountered_errors) {
 		fprintf(stderr, "Encountered errors while searching directories. Reported sizes may be innaccurate.\n");
 	}
@@ -555,8 +521,6 @@ static struct entry **traverseDirs(struct entry *root, int *res_size) {
 	free(threads);
 	sem_destroy(&T.main_sem);
 	sem_destroy(&T.worker_sem);
-	mtx_destroy(&T.toList.mtx);
-	mtx_destroy(&T.toStat.mtx);
 	mtx_destroy(&T.hl.lock);
 	free(T.hl.table);
 	*res_size = queue_size;
@@ -712,12 +676,10 @@ static void wrFileName(struct entry *node) {
 		}
 	}
 
-	if (!C.fullPath) {
-		// Find out where the last '/' is in the filename
-		const char *tmp = strrchr(filename, '/');
-		if (tmp != NULL) {
-			filename = tmp + 1;
-		}
+	// Find out where the last '/' is in the filename
+	const char *tmp = strrchr(filename, '/');
+	if (tmp != NULL) {
+		filename = tmp + 1;
 	}
 	wr(filename);
 
@@ -952,7 +914,7 @@ int main(int argc, char* argv[]) {
 	fillOutDefaults();
 	bool argErrors = false;
 	while (true) {
-		int c = getopt(argc, argv, "cCFlbsi:n:d:t:h");
+		int c = getopt(argc, argv, "cClbsi:n:d:t:h");
 		if (c == -1)
 			break;
 
@@ -962,9 +924,6 @@ int main(int argc, char* argv[]) {
 			break;
 		case 'C':
 			C.color = true;
-			break;
-		case 'F':
-			C.fullPath = true;
 			break;
 		case 'l':
 			C.dedupHardLinks = false;
