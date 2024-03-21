@@ -240,6 +240,88 @@ traverseDirs(std::queue<entry*> &&toSearch, struct entry *root) {
 	return q;
 }
 
+size_t calcBufSize(struct entry *root, int depth, int size, struct entry **arr) {
+	size_t bufSize = 0;
+	for (int i = 0; i < size; i++) {
+		if (arr[i]->parent == root) {
+			bufSize += calcBufSize(arr[i], depth + 1, size, arr);
+		}
+	}
+	bufSize += root->name.size();
+	bufSize += 1; // newline
+	bufSize += 5; // Size
+	bufSize += depth * 2 + 1; // FIXME indentation customization
+	bufSize += 6 + 4 * 3 + 1; // FIXME color: ESC[38;2 + ;255 * 4 + m
+	bufSize += 4; // Color reset \e[0m
+	return bufSize;
+}
+
+void insertSorted(struct entry *thing, int size, struct entry **arr) {
+	int i = 0;
+	// Find where it goes
+	while (i < size && thing->size <= arr[i]->size) i++;
+	// shift everything down
+	while (i < size) {
+		struct entry *tmp = thing;
+		thing = arr[i];
+		arr[i] = tmp;
+		i++;
+	}
+	// last element
+	arr[i] = thing;
+}
+
+size_t
+renderDisplay(struct entry *root, int idx, int depth, int size, struct entry **arr, char *buf) {
+	// Find children, remove them from the array and sort them
+	char *oldBuf = buf;
+	int childs = 0;
+	for (int i = 0; i < size; i++) {
+		if (arr[i]->parent == root) {
+			childs++;
+		}
+	}
+	struct entry **children = (struct entry**)malloc(sizeof(struct entry*) * childs);
+	int j = 0;
+	for (int i = 0; i < size; i++) {
+		if (arr[i]->parent == root) {
+			// Delete from arr?
+			insertSorted(arr[i], j, children);
+			j++;
+		}
+	}
+	// render children
+	for (j = 0; j < childs; j++) {
+		buf += renderDisplay(children[j], j, depth + 1, size, arr, buf);
+	}
+
+	// render self
+	// TODO print size
+	while (depth > 1) {
+		strcpy(buf, "| ");
+		buf += 2;
+		depth--;
+	}
+
+	if (depth == 1) {
+		if (idx == 0) {
+			// FIXME showing up at end instead of branching point
+			strcpy(buf, "/- ");
+		} else {
+			strcpy(buf, "|- ");
+		}
+		buf += 3;
+	}
+
+	memcpy(buf, root->name.data(), root->name.size());
+	buf += root->name.size();
+	*buf = '\n';
+	buf++;
+
+	free(children);
+	return buf - oldBuf;
+}
+
 int main(int argc, char* argv[]) {
 	// Default options
 	struct Config config {
@@ -287,13 +369,31 @@ int main(int argc, char* argv[]) {
 	std::priority_queue<entry*, std::vector<entry*>, decltype(&entryComparator)>
 		q = traverseDirs(std::move(toStat), &root);
 
-	// Print out the queue
+	// Dump it into a plain array for processing
+	// Make a tree out of the .parent pointers
+	// Format it somehow
+	struct entry **final_entries = (struct entry**)malloc(sizeof(entry*) * q.size());
+	int size = 0;
 	while (!q.empty()) {
-		struct entry *node = q.top();
+		final_entries[size] = q.top();
 		q.pop();
-		printf("%s: %li\n", node->name.c_str(), node->size);
-		delete node;
+		size++;
 	}
+
+	for (int i = 0; i < size; i++) {
+		printf("%s: %li\n", final_entries[i]->name.c_str(), final_entries[i]->size);
+	}
+
+	// Calculate size of buffer needed
+	size_t bufSize = calcBufSize(&root, 0, size, final_entries);
+	char *displayBuf = (char*)malloc(bufSize);
+
+	int written = renderDisplay(&root, 0, 0, size, final_entries, displayBuf);
+	// TODO: replace fwrite with write(2) so no line buffering
+	fwrite(displayBuf, 1, written, stdout);
+	fflush(stdout);
+
+	free(final_entries);
 
 	return 0;
 }
