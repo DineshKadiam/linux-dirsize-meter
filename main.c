@@ -693,6 +693,11 @@ static void wrFileName(struct entry *node) {
 //----------------------------------------------------------
 
 static void renderHumanReadable(uint64_t size) {
+	if (size == 0) {
+		wr("   0B ");
+		return;
+	}
+
 	static const char *suffixes = "BKMGTP";
 	// Sizes greater than 1023P are unsupported
 	static const uint64_t maxSize = (uint64_t)1024 * 1024 * 1024 * 1024 * 1024 * 1023;
@@ -800,6 +805,79 @@ renderDisplay(struct entry *root, struct indent_info *stack, int depth, int size
 }
 
 //----------------------------------------------------------
+// Path deduplicator
+//----------------------------------------------------------
+struct entry *makeSearchList(int count, char *paths[]) {
+	struct entry *root;
+	if (count == 0) {
+		root = (struct entry*)calloc(1, sizeof(struct entry) + 2);
+		root->name[0] = '.';
+		root->nameLen = 1;
+		return root;
+	}
+
+	const char total[] = "(total)";
+	root = (struct entry*)calloc(1, sizeof(struct entry) + sizeof(total));
+	memcpy(root->name, total, sizeof(total));
+	root->nameLen = sizeof(total) - 1;
+
+	// Find the absolute path for all arguments
+	char **absPaths = (char**)malloc(sizeof(char*) * count);
+	uint64_t *lens = (uint64_t*)malloc(sizeof(uint64_t) * count);
+	for (int i = 0; i < count; i++) {
+		absPaths[i] = realpath(paths[i], NULL);
+		if (absPaths[i] == NULL) {
+			fprintf(stderr, "Invalid argument %s: %s\n", paths[i], strerror(errno));
+		} else {
+			lens[i] = strlen(absPaths[i]);
+		}
+	}
+
+	// n^2 algorithm to see if any paths are prefixes of any others
+	struct entry **prev_next = &root->next;
+	for (int i = 0; i < count; i++) {
+		if (absPaths[i] == NULL) continue;
+		for (int j = 0; j < count; j++) {
+			if (i == j || absPaths[j] == NULL) continue;
+			if (lens[j] > lens[i] || 0 != memcmp(absPaths[i], absPaths[j], lens[j]))
+				continue;
+			// Don't detect 'test' as a prefix of 'testing'
+			if (lens[i] == lens[j] || absPaths[i][lens[j]] == '/') {
+				// j is a prefix of i
+				free(absPaths[i]);
+				absPaths[i] = NULL;
+				lens[i] = 0;
+				goto skip;
+			}
+		}
+
+		int len = strlen(paths[i]);
+		struct entry *node = (struct entry*)calloc(1, sizeof(struct entry) + len + 1);
+		node->parent = root;
+		node->nameLen = len;
+		memcpy(node->name, paths[i], len);
+
+		root->unsearched_children++;
+		*prev_next = node;
+		prev_next = &node->next;
+skip:
+	}
+
+	for (int i = 0; i < count; i++) {
+		free(absPaths[i]);
+	}
+	free(absPaths);
+	free(lens);
+	if (root->unsearched_children == 1) {
+		struct entry *tmp = root->next;
+		free(root);
+		root = tmp;
+		root->parent = NULL;
+	}
+	return root;
+}
+
+//----------------------------------------------------------
 // Venerable main
 //----------------------------------------------------------
 
@@ -883,22 +961,8 @@ int main(int argc, char* argv[]) {
 		return 1;
 	}
 
-	struct entry *root;
-	// Gather search paths
-	// TODO: Error message improvement
-	if (optind == argc) {
-		root = (struct entry*)calloc(1, sizeof(struct entry) + 2);
-		root->name[0] = '.';
-		root->name[1] = '\0';
-		root->nameLen = 1;
-	} else if (argc - optind == 1) {
-		int len = strlen(argv[optind]);
-		root = (struct entry*)calloc(1, sizeof(struct entry) + len + 1);
-		root->nameLen = len;
-		strcpy(root->name, argv[optind]);
-	} else {
-		fprintf(stderr, "Error: Only 1 search path is supported\n");
-		fprintf(stderr, "%s", USAGE);
+	struct entry *root = makeSearchList(argc - optind, &argv[optind]);
+	if (root == NULL) {
 		return 1;
 	}
 
@@ -906,12 +970,12 @@ int main(int argc, char* argv[]) {
 		initLsColors();
 	}
 
+	// Don't send traverse the (total) node
+	struct entry *listHead = root;
+	if (root->next != NULL) listHead = root->next;
 
-	// Dump it into a plain array for processing
-	// Make a tree out of the .parent pointers
-	// Format it somehow
 	int size;
-	struct entry **final_entries = traverseDirs(root, &size);
+	struct entry **final_entries = traverseDirs(listHead, &size);
 
 	if (size != 0) {
 		struct indent_info *stack = (struct indent_info*)malloc(sizeof(struct indent_info) * (C.maxDepth+1));
