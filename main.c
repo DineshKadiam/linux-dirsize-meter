@@ -56,6 +56,13 @@ OPTa("n", "number of rows to show (default is terminal size - 10)")
 OPTa("t", "number of threads to use")
 OPT("h", "show this help message");
 
+#undef L
+#undef R
+#undef B
+#undef U
+#undef OPT
+#undef OPTa
+
 struct Config {
 	int indentSize;
 	int rows;
@@ -293,6 +300,57 @@ static bool stack_is_empty(struct stack *s) {
 	return atomic_load_explicit(&s->head, memory_order_relaxed) == NULL;
 }
 
+//----------------------------------------------------------
+// Entry heap
+//----------------------------------------------------------
+
+// Heap property: Every node in the tree is smaller than either of its children
+//                Tree is as broad and shallow as possible
+static void siftDown(struct entry **heap, size_t size, int idx) {
+	size_t l;
+	while ((l = idx * 2 + 1) < size) {
+		size_t r = l + 1;
+		size_t smallestChild = l;
+		if (r < size && entryComparator(heap[l], heap[r])) {
+			smallestChild = r;
+		}
+		if (entryComparator(heap[idx], heap[smallestChild])) {
+			struct entry *tmp = heap[idx];
+			heap[idx] = heap[smallestChild];
+			heap[smallestChild] = tmp;
+			idx = smallestChild;
+		} else {
+			return;
+		}
+	}
+}
+
+static void pushHeap(struct entry **heap, size_t *size, struct entry *node) {
+	if (node->depth > (unsigned)C.maxDepth) {
+		free(node);
+		return;
+	}
+	if (*size <= (unsigned)C.rows - 1) {
+		// Don't have enough elements to fill the heap yet
+		heap[*size] = node;
+		*size += 1;
+		if (*size != (unsigned)C.rows) return;
+
+		// Build heap algorithm. See wikipedia.
+		for (int root = *size / 2 - 1; root >= 0; root--) {
+			siftDown(heap, *size, root);
+		}
+	} else {
+		// Don't bother sifting down if node < heap[0]
+		if (entryComparator(node, heap[0])) {
+			free(heap[0]);
+			heap[0] = node;
+			siftDown(heap, *size, 0);
+		} else {
+			free(node);
+		}
+	}
+}
 
 //----------------------------------------------------------
 // Traversal code
@@ -301,24 +359,30 @@ static bool stack_is_empty(struct stack *s) {
 // All these queues hold the entry of the file. toStat and toList will
 // have blank size and unsearched_children fields
 struct thread_data {
-	alignas(64) struct entry *_Atomic toMain;
 	alignas(64) _Atomic int num_blocked_threads;
-	alignas(64) _Atomic int main_blocked;
 	alignas(64) _Atomic bool encountered_errors;
 	alignas(64) sem_t worker_sem;
-	alignas(64) sem_t main_sem;
 	alignas(64) struct stack toList;
 	alignas(64) struct hl_table *hl;
-	alignas(64) _Atomic size_t numDirsScanned;
+};
+
+// Data specific to each thread
+struct thread_locals {
+	struct thread_data *T;
+	// Scratch buffer to be used like an arena
+	void *scr;
+	size_t scr_size;
+	struct entry **heap;
+	size_t heap_filled;
 };
 
 // Sends this node to main, and updates parents sending them to main as well if
 // necessary
-static void finishNode(struct thread_data *T, struct entry *node) {
-	struct entry *head = node;
-	struct entry **prev_next = &node->next;
-	uint64_t prev_size = node->size;
+static void finishNode(struct thread_locals *L, struct entry *node) {
+	struct entry *tmp = node;
 	node = node->parent;
+	uint64_t prev_size = tmp->size;
+	pushHeap(L->heap, &L->heap_filled, tmp);
 	// Build a list of all nodes to send to main
 	while (node != NULL) {
 		atomic_fetch_add(&node->size, prev_size);
@@ -326,14 +390,10 @@ static void finishNode(struct thread_data *T, struct entry *node) {
 		if (prev != 1)
 			break;
 		prev_size = atomic_load_explicit(&node->size, memory_order_relaxed);
-		*prev_next = node;
-		prev_next = &node->next;
+		tmp = node;
 		node = node->parent;
+		pushHeap(L->heap, &L->heap_filled, tmp);
 	}
-	*prev_next = atomic_load(&T->toMain);
-	while (!atomic_compare_exchange_weak(&T->toMain, prev_next, head));
-	if (atomic_load(&T->main_blocked))
-		sem_post(&T->main_sem);
 }
 
 static bool statNode(int at_fd, struct stat *sbuf, struct entry *ent, struct hl_table *hl) {
@@ -360,107 +420,138 @@ static bool statNode(int at_fd, struct stat *sbuf, struct entry *ent, struct hl_
 	return true;
 }
 
+// From getdents(2)
+struct linux_dirent64 {
+	ino64_t        d_ino;    // 64-bit inode number
+	off64_t        d_off;    // 64-bit offset to next structure
+	unsigned short d_reclen; // Size of this dirent
+	unsigned char  d_type;   // File type
+	char           d_name[]; // Filename (null-terminated)
+};
+
 // node MUST be a directory, and size needs to be already filled out
-static void doLs(struct thread_data *T, struct entry *node) {
-	DIR *dir = opendir(node->name);
-	if (dir == NULL) {
+static void doLs(struct thread_locals *const L, struct entry *const node) {
+	struct thread_data *const T = L->T;
+	int fd = open(node->name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+	if (fd == -1) {
 		atomic_store_explicit(&T->encountered_errors, true, memory_order_relaxed);
-		finishNode(T, node);
+		finishNode(L, node);
 		return;
 	}
 
-	struct entry *head = NULL;
+	// Read entire directory stream into scratch
+	size_t dents_len = 0;
 	while (true) {
-		// Loop through buffer
-		errno = 0;
-		const struct dirent *dirent = readdir(dir);
-		if (dirent == NULL) {
-			if (errno != 0)
-				atomic_store_explicit(&T->encountered_errors, true, memory_order_relaxed);
+		void *wr = (void*)((char*)L->scr + dents_len);
+		ssize_t result = getdents64(fd, wr, L->scr_size - dents_len);
+		if (result == -1) {
+			if (errno == EINVAL) {
+				L->scr_size *= 2;
+				L->scr = realloc(L->scr, L->scr_size);
+				continue;
+			}
+			atomic_store_explicit(&T->encountered_errors, true, memory_order_relaxed);
+			finishNode(L, node);
+			return;
+		} else if (result == 0) {
 			break;
 		}
-		if (strcmp(dirent->d_name, ".") == 0
-				|| strcmp(dirent->d_name, "..") == 0) {
-			continue;
-		}
 
-		size_t fileLen = strlen(dirent->d_name);
-		size_t newLen = node->nameLen + 2 + fileLen;
-		struct entry *tmp = (struct entry*)calloc(1, sizeof(struct entry) + newLen);
-
-		memcpy(tmp->name, node->name, node->nameLen);
-		tmp->nameLen = node->nameLen;
-		// Don't append / to the root
-		if (!(tmp->name[0] == '/' && tmp->name[1] == '\0'))
-			tmp->name[tmp->nameLen++] = '/';
-		memcpy(tmp->name + tmp->nameLen, dirent->d_name, fileLen);
-		tmp->nameLen += fileLen;
-		tmp->depth = node->depth + 1;
-		tmp->parent = node;
-
-		tmp->next = head;
-		head = tmp;
+		dents_len += result;
 	}
-
-	// fstatat loop
-	int fd = dirfd(dir);
-	if (fd == -1) fd = AT_FDCWD;
-
+			
+	// Process each entry one at a time, only allocating a struct for dirs or large files
 	struct entry *dirs = NULL;
 	struct entry **dirsLastPtr = &dirs;
-	struct entry *files = NULL;
-	struct entry **filesLastPtr = &files;
 	uint64_t children = 0;
-	while (head != NULL) {
-		struct entry *tmp = head;
-		head = head->next;
-
+	size_t pos = 0;
+	while (pos < dents_len) {
 		struct stat sbuf;
-		if (!statNode(fd, &sbuf, tmp, T->hl)) {
-			// do something, idk
-			free(tmp);
+		const struct linux_dirent64 *dent = (struct linux_dirent64*)((char*)L->scr + pos);
+		pos += dent->d_reclen;
+
+		int result = fstatat(fd, dent->d_name, &sbuf, AT_SYMLINK_NOFOLLOW);
+		if (result == -1) {
 			atomic_store_explicit(&T->encountered_errors, true, memory_order_relaxed);
 			continue;
 		}
+		if (strcmp(dent->d_name, ".") == 0
+				|| strcmp(dent->d_name, "..") == 0) {
+			continue;
+		}
+
+		// TODO: Hard link deduplication
+		// Figure out if big enough to make struct for or if dir
+		uint64_t size;
+		if (C.fileLength) {
+			size = sbuf.st_size;
+		} else {
+			size = 512 * sbuf.st_blocks;
+		}
+
+		if (!S_ISDIR(sbuf.st_mode)) {
+			node->size += size; // optimize?
+			if (L->heap_filled == (unsigned)C.rows) {
+				const struct entry *s = L->heap[0];
+				off64_t s_size = (off64_t)s->size;
+				if (s_size > sbuf.st_size || (s_size == sbuf.st_size && s->depth <= node->depth+1))
+					continue;
+			}
+		}
+
+		const size_t fileLen = strlen(dent->d_name);
+		struct entry *tmp = (struct entry*)calloc(1, sizeof(struct entry) + 2 + fileLen + node->nameLen);
+
+		if (node->name[0] == '/' && node->name[1] == '\0') {
+			tmp->name[0] = '/';
+			tmp->nameLen = 1;
+		} else {
+			tmp->nameLen = node->nameLen;
+			memcpy(tmp->name, node->name, node->nameLen);
+			tmp->name[tmp->nameLen++] = '/';
+		}
+		memcpy(tmp->name + tmp->nameLen, dent->d_name, fileLen);
+		tmp->nameLen += fileLen;
+		tmp->depth = node->depth + 1;
+		tmp->parent = node;
+		tmp->st_mode = sbuf.st_mode;
+		tmp->size = size;
 
 		if (S_ISDIR(sbuf.st_mode)) {
 			*dirsLastPtr = tmp;
 			dirsLastPtr = &tmp->next;
 			children++;
 		} else {
-			*filesLastPtr = tmp;
-			filesLastPtr = &tmp->next;
-			node->size += tmp->size; // optimize?
+			pushHeap(L->heap, &L->heap_filled, tmp);
 		}
 	}
-	closedir(dir);
+
+	close(fd);
 
 	// deal with output
 	atomic_store(&node->unsearched_children, children);
-	atomic_fetch_add_explicit(&T->numDirsScanned, 1, memory_order_relaxed);
 	if (dirs != NULL) {
 		stack_push_many(&T->toList, dirs, dirsLastPtr, children, &T->num_blocked_threads, &T->worker_sem);
 	} else {
-		finishNode(T, node);
-	}
-
-	if (files != NULL) {
-		*filesLastPtr = atomic_load(&T->toMain);
-		while (!atomic_compare_exchange_weak(&T->toMain, filesLastPtr, files));
-		if (atomic_load(&T->main_blocked))
-			sem_post(&T->main_sem);
+		finishNode(L, node);
 	}
 	return;
 }
 
 static int thread_func(void *data) {
 	// Stopping condition: work queues are empty and all other threads are blocked
-	struct thread_data *T = (struct thread_data*)data;
+	struct thread_locals *const L = (struct thread_locals*)data;
+	struct thread_data *const T = L->T;
+	const size_t init_scr_size = 512 * 1024;
+	L->scr = malloc(init_scr_size);
+	L->scr_size = init_scr_size;
+	L->heap = (struct entry**)malloc(sizeof(struct entry *) * C.rows);
+	L->heap_filled = 0;
 
 	while (true) {
 		struct entry *node;
 		if (NULL != (node = stack_pop(&T->toList))) {
-			doLs(T, node);
+			doLs(L, node);
 			continue;
 		}
 
@@ -472,146 +563,65 @@ static int thread_func(void *data) {
 
 		if (oldBlocked == C.threads - 1) {
 			// We're the last thread left, so we need to wake everyone up to die
-			sem_post(&T->main_sem);
 			for (int i = 0; i < C.threads; i++) {
 				sem_post(&T->worker_sem);
 			}
-			return 0;
+			break;
 		}
 		sem_wait(&T->worker_sem);
 		if (atomic_load(&T->num_blocked_threads) == C.threads) {
-			return 0;
+			break;
 		}
 		atomic_fetch_sub(&T->num_blocked_threads, 1);
 	}
-}
 
-// Heap property: Every node in the tree is smaller than either of its children
-//                Tree is as broad and shallow as possible
-static void siftDown(struct entry **heap, int size, int idx) {
-	int l;
-	while ((l = idx * 2 + 1) < size) {
-		int r = l + 1;
-		int smallestChild = l;
-		if (r < size && entryComparator(heap[l], heap[r])) {
-			smallestChild = r;
-		}
-		if (entryComparator(heap[idx], heap[smallestChild])) {
-			struct entry *tmp = heap[idx];
-			heap[idx] = heap[smallestChild];
-			heap[smallestChild] = tmp;
-			idx = smallestChild;
-		} else {
-			return;
-		}
-	}
-}
-
-static void pushHeap(struct entry **heap, int *size, struct entry *node) {
-	if (*size <= C.rows - 1) {
-		// Don't have enough elements to fill the heap yet
-		heap[*size] = node;
-		*size += 1;
-		if (*size != C.rows) return;
-
-		// Build heap algorithm. See wikipedia.
-		for (int root = *size / 2 - 1; root >= 0; root--) {
-			siftDown(heap, *size, root);
-		}
-	} else {
-		// Don't bother sifting down if node < heap[0]
-		if (entryComparator(node, heap[0])) {
-			free(heap[0]);
-			heap[0] = node;
-			siftDown(heap, *size, 0);
-		} else {
-			free(node);
-		}
-	}
-}
-
-static size_t pushHeapMany(struct entry **heap, int *size, struct entry *nodes) {
-	size_t numDirs = 0;
-	while (nodes != NULL) {
-		struct entry *tmp = nodes;
-		nodes = nodes->next;
-		numDirs += S_ISDIR(tmp->st_mode);
-		if (tmp->depth <= (unsigned)C.maxDepth)
-			pushHeap(heap, size, tmp);
-		else
-			free(tmp);
-	}
-	return numDirs;
-}
-
-static bool prg_update_needed(struct timespec last, struct timespec now) {
-	now.tv_sec -= last.tv_sec;
-	now.tv_nsec -= last.tv_nsec;
-	if (now.tv_nsec < 0) {
-		now.tv_sec--;
-		now.tv_nsec += 1000000000;
-	}
-	return now.tv_sec > 1 || now.tv_nsec > 250000000;
+	free(L->scr);
+	return 0;
 }
 
 static struct entry **
 traverseDirs(struct entry *dirs, struct entry *files, int *res_size, struct hl_table *hl) {
 	struct thread_data T = {
-		.toMain = NULL,
 		.toList = {.head = dirs, .lock = ATOMIC_FLAG_INIT},
 		.hl = hl,
 		.encountered_errors = false,
 		.num_blocked_threads = 0,
-		.main_blocked = 0,
-		.numDirsScanned = 0,
 	};
-	sem_init(&T.main_sem, 0, 0);
 	sem_init(&T.worker_sem, 0, 0);
 
-	int queue_size = 0;
-	struct entry **queue = (struct entry **)malloc(sizeof(struct entry*) * (C.rows + 1));
-	pushHeapMany(queue, &queue_size, files);
-
 	// Spawn I/O threads
-	thrd_t *threads = malloc(sizeof(thrd_t) * C.threads);
-	for (int i = 0; i < C.threads; i++) {
-		if (thrd_success != thrd_create(&threads[i], thread_func, &T)) {
+	struct thread_locals *locals = (struct thread_locals*)malloc(sizeof(struct thread_locals) * C.threads);
+	thrd_t *threads = malloc(sizeof(thrd_t) * (C.threads - 1));
+	for (int i = 0; i < C.threads - 1; i++) {
+		locals[i].T = &T;
+		if (thrd_success != thrd_create(&threads[i], thread_func, &locals[i])) {
 			fprintf(stderr, "Fatal error: unable to create thread\n");
 			abort();
 		}
 	}
 
-	size_t total_dirs_scanned = 0;
-	struct timespec last_prg_update;
-	clock_gettime(CLOCK_MONOTONIC, &last_prg_update);
+	// Also run thread_func with main thread
+	struct thread_locals *L = &locals[C.threads-1];
+	L->T = &T;
+	thread_func(L);
 
-	while (true) {
-		struct entry *list = atomic_exchange(&T.toMain, NULL);
-		if (list == NULL) {
-			atomic_store(&T.main_blocked, 1);
-			// Have to recheck the stack to prevent deadlock
-			if (atomic_load(&T.toMain) == NULL) {
-				// When every thread is blocked, they all exit
-				if (atomic_load(&T.num_blocked_threads) == C.threads)
-					break;
-				sem_wait(&T.main_sem);
-			}
-			atomic_store(&T.main_blocked, 0);
-			continue;
+	// Merge all the heaps from the various threads into this one
+	struct entry **heap = L->heap;
+	size_t heap_filled = L->heap_filled;
+	for (int i = 0; i < C.threads - 1; i++) {
+		for (size_t j = 0; j < locals[i].heap_filled; j++) {
+			pushHeap(heap, &heap_filled, locals[i].heap[j]);
 		}
-		total_dirs_scanned += pushHeapMany(queue, &queue_size, list);
-		struct timespec now;
-		clock_gettime(CLOCK_MONOTONIC, &now);
-		if (prg_update_needed(last_prg_update, now)) {
-			last_prg_update = now;
-			fprintf(stderr, "\rScanning directories... %li scanned", T.numDirsScanned);
-		}
+		free(locals[i].heap);
 	}
 
-	// Erase progress bar
-	fprintf(stderr, "\r\033[K");
+	while (files != NULL) {
+		struct entry *tmp = files;
+		files = files->next;
+		pushHeap(heap, &heap_filled, tmp);
+	}
 
-	for (int i = 0; i < C.threads; i++) {
+	for (int i = 0; i < C.threads - 1; i++) {
 		// Errors here aren't fatal, so ignore
 		thrd_join(threads[i], NULL);
 	}
@@ -621,10 +631,10 @@ traverseDirs(struct entry *dirs, struct entry *files, int *res_size, struct hl_t
 	}
 
 	free(threads);
-	sem_destroy(&T.main_sem);
+	free(locals);
 	sem_destroy(&T.worker_sem);
-	*res_size = queue_size;
-	return queue;
+	*res_size = heap_filled;
+	return heap;
 }
 
 //----------------------------------------------------------
@@ -1075,8 +1085,8 @@ void fillOutDefaults(void) {
 
 	// Linuxism
 	const int num_cpus = sysconf(_SC_NPROCESSORS_ONLN);
-	if (num_cpus + 1 > C.threads) {
-		C.threads = num_cpus + 1;
+	if (num_cpus > C.threads) {
+		C.threads = num_cpus;
 	}
 }
 
