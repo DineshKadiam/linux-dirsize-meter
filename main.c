@@ -466,17 +466,18 @@ static void doLs(struct thread_locals *const L, struct entry *const node) {
 	uint64_t children = 0;
 	size_t pos = 0;
 	while (pos < dents_len) {
-		struct stat sbuf;
+		struct statx sbuf;
 		const struct linux_dirent64 *dent = (struct linux_dirent64*)((char*)L->scr + pos);
 		pos += dent->d_reclen;
 
-		int result = fstatat(fd, dent->d_name, &sbuf, AT_SYMLINK_NOFOLLOW);
-		if (result == -1) {
-			atomic_store_explicit(&T->encountered_errors, true, memory_order_relaxed);
-			continue;
-		}
 		if (strcmp(dent->d_name, ".") == 0
 				|| strcmp(dent->d_name, "..") == 0) {
+			continue;
+		}
+
+		int result = statx(fd, dent->d_name, AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT, STATX_BASIC_STATS, &sbuf);
+		if (result == -1) {
+			atomic_store_explicit(&T->encountered_errors, true, memory_order_relaxed);
 			continue;
 		}
 
@@ -484,17 +485,16 @@ static void doLs(struct thread_locals *const L, struct entry *const node) {
 		// Figure out if big enough to make struct for or if dir
 		uint64_t size;
 		if (C.fileLength) {
-			size = sbuf.st_size;
+			size = sbuf.stx_size;
 		} else {
-			size = 512 * sbuf.st_blocks;
+			size = 512 * sbuf.stx_blocks;
 		}
 
-		if (!S_ISDIR(sbuf.st_mode)) {
+		if (!S_ISDIR(sbuf.stx_mode)) {
 			node->size += size; // optimize?
 			if (L->heap_filled == (unsigned)C.rows) {
 				const struct entry *s = L->heap[0];
-				off64_t s_size = (off64_t)s->size;
-				if (s_size > sbuf.st_size || (s_size == sbuf.st_size && s->depth <= node->depth+1))
+				if (size > sbuf.stx_size || (size == sbuf.stx_size && s->depth <= node->depth+1))
 					continue;
 			}
 		}
@@ -514,10 +514,10 @@ static void doLs(struct thread_locals *const L, struct entry *const node) {
 		tmp->nameLen += fileLen;
 		tmp->depth = node->depth + 1;
 		tmp->parent = node;
-		tmp->st_mode = sbuf.st_mode;
+		tmp->st_mode = sbuf.stx_mode;
 		tmp->size = size;
 
-		if (S_ISDIR(sbuf.st_mode)) {
+		if (S_ISDIR(sbuf.stx_mode)) {
 			*dirsLastPtr = tmp;
 			dirsLastPtr = &tmp->next;
 			children++;
