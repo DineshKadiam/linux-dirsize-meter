@@ -46,6 +46,9 @@ const char USAGE[] =
 "\n"
 B U "Usage:" R " dut [OPTIONS]... [path]...\n"
 "Default search path is '.'\n"
+"The first column represents the total size of a directory and the second\n"
+"column shows the portion of a directory that is shared with others (e.g. hard\n"
+"links).\n"
 "\n"
 B U "Useful environment variables:\n" R
 OPT("NO_COLOR", "set to any non-empty value to disable colorized output")
@@ -125,8 +128,8 @@ static void printUsage() {
 	if (!C.color) {
 		// Strip out all escapes
 		char buf[2048];
-		uintptr_t r = 0;
-		uintptr_t w = 0;
+		size_t r = 0;
+		size_t w = 0;
 		while (r < sizeof(USAGE) - 1) {
 			while (USAGE[r] == '\033') {
 				while (!isalpha(USAGE[r]))
@@ -281,10 +284,10 @@ static uint64_t nextPwrOf2(uint64_t num) {
 static struct hard_link *lt_slot(struct link_table *lt, uint64_t dev, uint64_t ino) {
 	if (lt->count + lt->deleted + 1 >= lt->size / 2) {
 		// Reallocate
-		uint64_t oldSize = lt->size;
+		size_t oldSize = lt->size;
 		struct hard_link *oldTable = lt->table;
 		lt->size = (size_t)nextPwrOf2(lt->count);
-		if (lt->size < 4) lt->size = 4;
+		if (lt->size < 16) lt->size = 16;
 		lt->table = calloc(sizeof(struct link_table), lt->size);
 		lt->deleted = 0;
 		if (oldTable != NULL) {
@@ -568,7 +571,7 @@ doStat(struct thread_locals *const L, int fd, struct entry *root, const struct l
 
 		if (L->heap_filled == (unsigned)C.rows) {
 			const struct entry *s = L->heap[0];
-			if (size > sbuf.stx_size || (size == sbuf.stx_size && s->depth <= root->depth+1))
+			if (s->size > sbuf.stx_size || (s->size == sbuf.stx_size && s->depth <= root->depth+1))
 				return NULL;
 		}
 	}
@@ -640,8 +643,8 @@ static void doLs(struct thread_locals *const L, struct entry *const node) {
 		const struct linux_dirent64 *dent = (struct linux_dirent64*)((char*)L->scr + pos);
 		pos += dent->d_reclen;
 
-		if (strcmp(dent->d_name, ".") == 0
-				|| strcmp(dent->d_name, "..") == 0) {
+		if (dent->d_name[0] == '.' && (dent->d_name[1] == '\0'
+				|| (dent->d_name[1] == '.' && dent->d_name[2] == '\0'))) {
 			continue;
 		}
 
@@ -821,7 +824,6 @@ static void initLsColors(void) {
 	tmp = color_g.env;
 	int i = 0;
 	int j = 0;
-	// FIXME ugly mess
 	const char *special[] = {"ow", "di", "ex", "fi"};
 	enum {EXT, SPECIAL, CONT, BEGIN} state = BEGIN;
 	for (char *tmp = color_g.env; *tmp != '\0'; tmp++) {
@@ -972,6 +974,16 @@ static void renderHumanReadable(uint64_t size) {
 	wr(finalBuf);
 }
 
+static void wrSize(uint64_t size) {
+	if (C.humanReadable) {
+		renderHumanReadable(size);
+	} else {
+		char sizeBuf[17] = {0};
+		snprintf(sizeBuf, 17, "%15" PRIu64 " ", size);
+		wr(sizeBuf);
+	}
+}
+
 struct indent_info {
 	// Idx is the index of current node in parent's level. 0 = first thing printed
 	int idx;
@@ -1003,15 +1015,9 @@ renderDisplay(struct entry *root, struct indent_info *stack, int depth, int size
 	}
 
 	// render self, starting with size
-	if (!C.humanReadable) {
-		// Pad out to 16 characters for size
-		char sizeBuf[17] = {0};
-		snprintf(sizeBuf, 17, "%15" PRIu64 " ", root->size);
-		wr(sizeBuf);
-	} else {
-		renderHumanReadable(root->size);
-		renderHumanReadable(root->shared_size);
-	}
+	wrSize(root->size);
+	if (C.dedupHardLinks)
+		wrSize(root->shared_size);
 
 	// Indentation
 	int i = 0;
