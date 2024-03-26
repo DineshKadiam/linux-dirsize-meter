@@ -24,6 +24,13 @@
 #include <unistd.h>
 
 //----------------------------------------------------------
+// Forward definitions
+//----------------------------------------------------------
+
+struct link_table;
+static void lt_destroy(struct link_table*);
+
+//----------------------------------------------------------
 // Constants, globals, and structures
 //----------------------------------------------------------
 
@@ -90,14 +97,25 @@ static struct Config C = {
 // All the data about individual files and directories is in this struct
 struct entry {
 	_Atomic uint64_t unsearched_children;
+	// data only under this entry = size - shared_size
 	_Atomic uint64_t size;
+	_Atomic uint64_t shared_size;
+	uint64_t depth;
+	size_t nameLen; // Does NOT include null terminator!
+	struct link_table *_Atomic lt;
 	struct entry *parent;
 	struct entry *next; // For use in stacks
-	uint64_t depth;
 	mode_t st_mode;
-	size_t nameLen; // Does NOT include null terminator!
 	char name[];
 };
+
+static void free_entry(struct entry *ent) {
+	if (ent->lt != NULL) {
+		lt_destroy(ent->lt);
+		free(ent->lt);
+	}
+	free(ent);
+}
 
 //----------------------------------------------------------
 // Utility functions
@@ -192,65 +210,120 @@ static bool entryComparator(const struct entry *a, const struct entry *b) {
 // Hard link table
 //----------------------------------------------------------
 
-struct hard_link {
-	dev_t st_dev;
-	ino_t st_ino;
-	bool slotFilled;
+enum slotStatus {
+	EMPTY = 0,
+	DEL,
+	FILLED,
 };
 
-struct hl_table {
-	// Open address table with quadratic probing. Max load factor = 2
+struct hard_link {
+	uint64_t ino;
+	uint64_t dev;
+	uint64_t size;
+	uint32_t extant_count;
+	uint32_t nlink;
+	uint32_t slotFilled;
+};
+
+struct link_table {
+	// Open address table with quadratic probing. Max load factor = 1/2
+	// Uses tombstones for deletion and rehashes when load factor is hit
 	mtx_t lock;
 	struct hard_link *table;
-	uint64_t size;
-	uint64_t count;
+	size_t size;
+	size_t count; // Number of elements in table
+	size_t deleted;
 };
 
-// Lock must be held. Returns true iff hard link already in hash table
-static bool hl_insert(struct hl_table *hl, dev_t st_dev, ino_t st_ino) {
-	uint64_t idx = st_ino & (hl->size-1);
-	uint64_t step = 0;
+static void lt_init(struct link_table *lt) {
+	mtx_init(&lt->lock, mtx_plain);
+	lt->size = 32; // Default initial size
+	lt->count = 0;
+	lt->deleted = 0;
+	lt->table = (struct hard_link*)calloc(lt->size, sizeof(struct hard_link));
+}
+
+static void lt_destroy(struct link_table *lt) {
+	mtx_destroy(&lt->lock);
+	free(lt->table);
+}
+
+static struct hard_link *lt_find(struct link_table *lt, uint64_t dev, uint64_t ino) {
+	// Incredible hash function
+	size_t idx = ino & (lt->size-1);
+	size_t step = 0;
 	while (true) {
 		idx += step;
 		step++;
 		// Truncate
-		idx &= hl->size - 1;
-		if (!hl->table[idx].slotFilled) {
-			hl->table[idx].slotFilled = true;
-			hl->table[idx].st_dev = st_dev;
-			hl->table[idx].st_ino = st_ino;
-			return false;
-		} else if (hl->table[idx].st_dev == st_dev && hl->table[idx].st_ino == st_ino) {
-			return true;
+		idx &= lt->size - 1;
+		if (lt->table[idx].slotFilled == EMPTY
+				|| (lt->table[idx].slotFilled == FILLED
+				&& lt->table[idx].dev == dev
+				&& lt->table[idx].ino == ino)) {
+			return &lt->table[idx];
 		}
 	}
 }
 
-// External function. Checks if this link has already been seen, and records it
-static bool hl_already_seen(struct hl_table *hl, dev_t st_dev, ino_t st_ino) {
-	mtx_lock(&hl->lock);
-	if (hl->count + 1 >= hl->size / 2) {
-		fprintf(stderr, "reallocating hash map\n");
+static uint64_t nextPwrOf2(uint64_t num) {
+	num--;
+	num |= num >> 1;
+	num |= num >> 2;
+	num |= num >> 4;
+	num |= num >> 8;
+	num |= num >> 16;
+	num |= num >> 32;
+	num++;
+	return num << 1;
+}
+// lt_find with reallocation
+static struct hard_link *lt_slot(struct link_table *lt, uint64_t dev, uint64_t ino) {
+	if (lt->count + lt->deleted + 1 >= lt->size / 2) {
 		// Reallocate
-		uint64_t oldSize = hl->size;
-		struct hard_link *oldTable = hl->table;
-		hl->size *= 2;
-		if (hl->size < 512) hl->size = 512;
-		hl->table = calloc(sizeof(struct hard_link), hl->size);
+		uint64_t oldSize = lt->size;
+		struct hard_link *oldTable = lt->table;
+		lt->size = (size_t)nextPwrOf2(lt->count);
+		if (lt->size < 4) lt->size = 4;
+		lt->table = calloc(sizeof(struct link_table), lt->size);
+		lt->deleted = 0;
 		if (oldTable != NULL) {
-			for (uint64_t i = 0; i < oldSize; i++) {
-				if (oldTable[i].slotFilled) {
-					hl_insert(hl, oldTable[i].st_dev, oldTable[i].st_ino);
+			for (size_t i = 0; i < oldSize; i++) {
+				if (oldTable[i].slotFilled == FILLED) {
+					struct hard_link *newSlot = lt_find(lt, oldTable[i].dev, oldTable[i].ino);
+					*newSlot = oldTable[i];
 				}
 			}
 			free(oldTable);
 		}
 	}
+	return lt_find(lt, dev, ino);
+}
 
-	bool alreadyExist = hl_insert(hl, st_dev, st_ino);
-	if (!alreadyExist) hl->count++;
-	mtx_unlock(&hl->lock);
-	return alreadyExist;
+// External function. Checks if this link has already been seen, and records it
+// Returns: The number of times this link still hasn't been seen.
+static uint32_t lt_check(struct link_table *lt, uint64_t dev, uint64_t ino, uint32_t nlink, uint64_t size) {
+	mtx_lock(&lt->lock);
+	struct hard_link *slot = lt_slot(lt, dev, ino);
+	if (slot->slotFilled == EMPTY) {
+		slot->ino = ino;
+		slot->dev = dev;
+		slot->extant_count = nlink - 1;
+		slot->nlink = nlink;
+		slot->size = size;
+		slot->slotFilled = FILLED;
+		lt->count++;
+	} else {
+		// Slot already exists
+		slot->extant_count--;
+		if (slot->extant_count == 0) {
+			slot->slotFilled = DEL;
+			lt->count--;
+			lt->deleted++;
+		}
+	}
+	mtx_unlock(&lt->lock);
+	return slot->extant_count;
 }
 
 //----------------------------------------------------------
@@ -327,7 +400,7 @@ static void siftDown(struct entry **heap, size_t size, int idx) {
 
 static void pushHeap(struct entry **heap, size_t *size, struct entry *node) {
 	if (node->depth > (unsigned)C.maxDepth) {
-		free(node);
+		free_entry(node);
 		return;
 	}
 	if (*size <= (unsigned)C.rows - 1) {
@@ -343,11 +416,11 @@ static void pushHeap(struct entry **heap, size_t *size, struct entry *node) {
 	} else {
 		// Don't bother sifting down if node < heap[0]
 		if (entryComparator(node, heap[0])) {
-			free(heap[0]);
+			free_entry(heap[0]);
 			heap[0] = node;
 			siftDown(heap, *size, 0);
 		} else {
-			free(node);
+			free_entry(node);
 		}
 	}
 }
@@ -363,7 +436,6 @@ struct thread_data {
 	alignas(64) _Atomic bool encountered_errors;
 	alignas(64) sem_t worker_sem;
 	alignas(64) struct stack toList;
-	alignas(64) struct hl_table *hl;
 };
 
 // Data specific to each thread
@@ -376,49 +448,75 @@ struct thread_locals {
 	size_t heap_filled;
 };
 
+static struct link_table *
+mergeTables(struct entry *node, struct link_table *lt) {
+	if (lt == NULL) {
+		lt = node->lt;
+		if (lt != NULL) mtx_lock(&lt->lock);
+		return lt;
+	}
+	// Happy case: parent directory has no table. Just move current one up.
+	struct link_table *parent = NULL;
+	if (atomic_compare_exchange_strong(&node->lt, &parent, lt)) {
+		return lt;
+	}
+	// Merge child table into parent and adjust totals
+	mtx_lock(&parent->lock);
+	for (size_t i = 0; i < lt->size; i++) {
+		struct hard_link *sl = &lt->table[i];
+		if (lt->table[i].slotFilled != FILLED)
+			continue;
+		struct hard_link *newsl = lt_slot(parent, sl->dev, sl->ino);
+		if (newsl->slotFilled == EMPTY)
+			*newsl = *sl;
+		else {
+			newsl->extant_count = sl->nlink - sl->extant_count;
+			node->size -= newsl->size; // Avoid double-counting from child and parent copies
+			if (newsl->extant_count == 0) {
+				parent->deleted++;
+				parent->count--;
+				node->shared_size -= newsl->size;
+				newsl->slotFilled = DEL;
+			}
+		}
+	}
+
+	mtx_unlock(&lt->lock);
+	lt_destroy(lt);
+	free(lt);
+	return parent;
+}
+
 // Sends this node to main, and updates parents sending them to main as well if
 // necessary
 static void finishNode(struct thread_locals *L, struct entry *node) {
 	struct entry *tmp = node;
 	node = node->parent;
 	uint64_t prev_size = tmp->size;
+	uint64_t prev_shared = tmp->shared_size;
+	struct link_table *lt = atomic_load(&tmp->lt);
+	tmp->lt = NULL;
+	if (lt != NULL) mtx_lock(&lt->lock);
 	pushHeap(L->heap, &L->heap_filled, tmp);
-	// Build a list of all nodes to send to main
+	// Inv: node needs to have totals adjusted by prev_size and lt
+	// lt's mutex is locked
 	while (node != NULL) {
 		atomic_fetch_add(&node->size, prev_size);
+		atomic_fetch_add(&node->shared_size, prev_shared);
+		lt = mergeTables(node, lt);
 		int prev = atomic_fetch_sub(&node->unsearched_children, 1);
 		if (prev != 1)
 			break;
 		prev_size = atomic_load_explicit(&node->size, memory_order_relaxed);
+		prev_shared = atomic_load_explicit(&node->shared_size, memory_order_relaxed);
 		tmp = node;
+		tmp->lt = NULL;
 		node = node->parent;
 		pushHeap(L->heap, &L->heap_filled, tmp);
 	}
+	if (lt != NULL) mtx_unlock(&lt->lock);
 }
 
-static bool statNode(int at_fd, struct stat *sbuf, struct entry *ent, struct hl_table *hl) {
-	const char *name = ent->name;
-	if (at_fd != AT_FDCWD)
-		name = strrchr(name, '/') + 1;
-	int result = fstatat(at_fd, name, sbuf, AT_SYMLINK_NOFOLLOW);
-	if (result == -1)
-		return false;
-
-	ent->st_mode = sbuf->st_mode;
-	if (C.fileLength) {
-		ent->size = sbuf->st_size;
-	} else {
-		ent->size = 512 * sbuf->st_blocks;
-	}
-
-	if (!S_ISDIR(sbuf->st_mode)) {
-		// Kind of rudimentary. Possible improvement: don't send to toMain at all
-		if (C.dedupHardLinks && sbuf->st_nlink > 1 && hl_already_seen(hl, sbuf->st_dev, sbuf->st_ino)) {
-			ent->size = 0;
-		}
-	}
-	return true;
-}
 
 // From getdents(2)
 struct linux_dirent64 {
@@ -428,6 +526,77 @@ struct linux_dirent64 {
 	unsigned char  d_type;   // File type
 	char           d_name[]; // Filename (null-terminated)
 };
+
+// Only returns an entry for a directory. Files are pushed to heap.
+static struct entry *
+doStat(struct thread_locals *const L, int fd, struct entry *root, const struct linux_dirent64 *dent) {
+	struct thread_data *const T = L->T;
+	struct statx sbuf;
+	int result = statx(fd, dent->d_name, AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT, STATX_BASIC_STATS, &sbuf);
+	if (result == -1) {
+		atomic_store_explicit(&T->encountered_errors, true, memory_order_relaxed);
+		return NULL;
+	}
+
+	uint64_t dev = (uint64_t)sbuf.stx_dev_major << 32 | (uint64_t)sbuf.stx_dev_minor;
+	uint64_t size;
+	if (C.fileLength) {
+		size = sbuf.stx_size;
+	} else {
+		size = 512 * sbuf.stx_blocks;
+	}
+
+	if (!S_ISDIR(sbuf.stx_mode)) {
+		if (C.dedupHardLinks && sbuf.stx_nlink > 1) {
+			if (root->lt == NULL) {
+				root->lt = (struct link_table*)malloc(sizeof(struct link_table));
+				lt_init(root->lt);
+			}
+			uint32_t remainingLinks = lt_check(root->lt, dev, sbuf.stx_ino, sbuf.stx_nlink, size);
+			if (remainingLinks == sbuf.stx_nlink - 1) {
+				root->size += size;
+				root->shared_size += size;
+			} else if (remainingLinks == 0) {
+				// All of this hard link was inside this dir, so no need to look elsewhere
+				root->shared_size -= size;
+			}
+		} else {
+			root->size += size;
+		}
+
+		if (L->heap_filled == (unsigned)C.rows) {
+			const struct entry *s = L->heap[0];
+			if (size > sbuf.stx_size || (size == sbuf.stx_size && s->depth <= root->depth+1))
+				return NULL;
+		}
+	}
+
+	const size_t fileLen = strlen(dent->d_name);
+	struct entry *tmp = (struct entry*)calloc(1, sizeof(struct entry) + 2 + fileLen + root->nameLen);
+
+	if (root->name[0] == '/' && root->name[1] == '\0') {
+		tmp->name[0] = '/';
+		tmp->nameLen = 1;
+	} else {
+		tmp->nameLen = root->nameLen;
+		memcpy(tmp->name, root->name, root->nameLen);
+		tmp->name[tmp->nameLen++] = '/';
+	}
+	memcpy(tmp->name + tmp->nameLen, dent->d_name, fileLen);
+	tmp->nameLen += fileLen;
+	tmp->depth = root->depth + 1;
+	tmp->parent = root;
+	tmp->st_mode = sbuf.stx_mode;
+	tmp->size = size;
+
+	if (!S_ISDIR(sbuf.stx_mode)) {
+		if (sbuf.stx_nlink > 1)
+			tmp->shared_size = size;
+		pushHeap(L->heap, &L->heap_filled, tmp);
+		return NULL;
+	}
+	return tmp;
+}
 
 // node MUST be a directory, and size needs to be already filled out
 static void doLs(struct thread_locals *const L, struct entry *const node) {
@@ -466,7 +635,6 @@ static void doLs(struct thread_locals *const L, struct entry *const node) {
 	uint64_t children = 0;
 	size_t pos = 0;
 	while (pos < dents_len) {
-		struct statx sbuf;
 		const struct linux_dirent64 *dent = (struct linux_dirent64*)((char*)L->scr + pos);
 		pos += dent->d_reclen;
 
@@ -475,54 +643,11 @@ static void doLs(struct thread_locals *const L, struct entry *const node) {
 			continue;
 		}
 
-		int result = statx(fd, dent->d_name, AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT, STATX_BASIC_STATS, &sbuf);
-		if (result == -1) {
-			atomic_store_explicit(&T->encountered_errors, true, memory_order_relaxed);
-			continue;
-		}
-
-		// TODO: Hard link deduplication
-		// Figure out if big enough to make struct for or if dir
-		uint64_t size;
-		if (C.fileLength) {
-			size = sbuf.stx_size;
-		} else {
-			size = 512 * sbuf.stx_blocks;
-		}
-
-		if (!S_ISDIR(sbuf.stx_mode)) {
-			node->size += size; // optimize?
-			if (L->heap_filled == (unsigned)C.rows) {
-				const struct entry *s = L->heap[0];
-				if (size > sbuf.stx_size || (size == sbuf.stx_size && s->depth <= node->depth+1))
-					continue;
-			}
-		}
-
-		const size_t fileLen = strlen(dent->d_name);
-		struct entry *tmp = (struct entry*)calloc(1, sizeof(struct entry) + 2 + fileLen + node->nameLen);
-
-		if (node->name[0] == '/' && node->name[1] == '\0') {
-			tmp->name[0] = '/';
-			tmp->nameLen = 1;
-		} else {
-			tmp->nameLen = node->nameLen;
-			memcpy(tmp->name, node->name, node->nameLen);
-			tmp->name[tmp->nameLen++] = '/';
-		}
-		memcpy(tmp->name + tmp->nameLen, dent->d_name, fileLen);
-		tmp->nameLen += fileLen;
-		tmp->depth = node->depth + 1;
-		tmp->parent = node;
-		tmp->st_mode = sbuf.stx_mode;
-		tmp->size = size;
-
-		if (S_ISDIR(sbuf.stx_mode)) {
-			*dirsLastPtr = tmp;
-			dirsLastPtr = &tmp->next;
+		struct entry *dir = doStat(L, fd, node, dent);
+		if (dir != NULL) {
+			*dirsLastPtr = dir;
+			dirsLastPtr = &dir->next;
 			children++;
-		} else {
-			pushHeap(L->heap, &L->heap_filled, tmp);
 		}
 	}
 
@@ -580,10 +705,9 @@ static int thread_func(void *data) {
 }
 
 static struct entry **
-traverseDirs(struct entry *dirs, struct entry *files, int *res_size, struct hl_table *hl) {
+traverseDirs(struct entry *dirs, struct entry *files, int *res_size) {
 	struct thread_data T = {
 		.toList = {.head = dirs, .lock = ATOMIC_FLAG_INIT},
-		.hl = hl,
 		.encountered_errors = false,
 		.num_blocked_threads = 0,
 	};
@@ -884,6 +1008,7 @@ renderDisplay(struct entry *root, struct indent_info *stack, int depth, int size
 		wr(sizeBuf);
 	} else {
 		renderHumanReadable(root->size);
+		renderHumanReadable(root->shared_size);
 	}
 
 	// Indentation
@@ -923,10 +1048,10 @@ renderDisplay(struct entry *root, struct indent_info *stack, int depth, int size
 // This function normalizes a path by removing all extraneous . .. and / segments
 static size_t normalizePath(char *const path) {
 	const bool absolute = path[0] == '/';
-	uintptr_t begin = 0;
+	size_t begin = 0;
 	if (absolute) begin++;
-	uintptr_t write = begin;
-	uintptr_t read = begin;
+	size_t write = begin;
+	size_t read = begin;
 	//inv:
 	//read..end is remaining path
 	//write..read is skipped chars
@@ -966,9 +1091,37 @@ static size_t normalizePath(char *const path) {
 	return write;
 }
 
+static bool statNode(struct stat *sbuf, struct entry *ent) {
+	int result = lstat(ent->name, sbuf);
+	if (result == -1)
+		return false;
+
+	ent->st_mode = sbuf->st_mode;
+	if (C.fileLength) {
+		ent->size = sbuf->st_size;
+	} else {
+		ent->size = 512 * sbuf->st_blocks;
+	}
+
+	if (!S_ISDIR(sbuf->st_mode)) {
+		if (C.dedupHardLinks && sbuf->st_nlink > 1) {
+			ent->shared_size = ent->size;
+			uint32_t extant = lt_check(ent->parent->lt, sbuf->st_dev, sbuf->st_ino, sbuf->st_nlink, ent->size);
+			if (extant == sbuf->st_nlink - 1) {
+				ent->parent->shared_size += ent->size;
+				ent->parent->size += ent->size;
+			} else if (extant == 0) {
+				ent->parent->shared_size -= ent->size;
+			}
+		} else {
+			ent->parent->size += ent->size;
+		}
+	}
+	return true;
+}
 // Returns root node. dirs and files are output args for children of root and potentially root
 static struct entry *
-makeSearchList(int count, char *paths[], struct entry **dirs, struct entry **files, struct hl_table *hl) {
+makeSearchList(int count, char *paths[], struct entry **dirs, struct entry **files) {
 	struct entry *root;
 	struct stat sbuf;
 	if (count == 0) {
@@ -976,7 +1129,11 @@ makeSearchList(int count, char *paths[], struct entry **dirs, struct entry **fil
 		root->name[0] = '.';
 		root->nameLen = 1;
 		*dirs = root;
-		statNode(AT_FDCWD, &sbuf, root, hl);
+		lstat(root->name, &sbuf);
+		root->st_mode = sbuf.st_mode;
+		root->size = 512 * sbuf.st_blocks;
+		if (C.fileLength)
+			root->size = sbuf.st_size;
 		return root;
 	}
 
@@ -985,6 +1142,8 @@ makeSearchList(int count, char *paths[], struct entry **dirs, struct entry **fil
 	root = (struct entry*)calloc(1, sizeof(struct entry) + sizeof(total));
 	memcpy(root->name, total, sizeof(total));
 	root->nameLen = sizeof(total) - 1;
+	root->lt = (struct link_table*)calloc(1, sizeof(struct link_table));
+	lt_init(root->lt);
 
 	// Stat all inputs and get absolute path
 	// If node is NULL then this candidate has been rejected
@@ -995,7 +1154,7 @@ makeSearchList(int count, char *paths[], struct entry **dirs, struct entry **fil
 	};
 	struct candidate *const cands = (struct candidate*)malloc(sizeof(struct candidate) * count);
 	for (int i = 0; i < count; i++) {
-		const uintptr_t nameLen = strlen(paths[i]);
+		const size_t nameLen = strlen(paths[i]);
 		cands[i].node = (struct entry*)calloc(1, sizeof(struct entry) + nameLen + 2);
 		struct entry *n = cands[i].node;
 		n->parent = root;
@@ -1003,16 +1162,16 @@ makeSearchList(int count, char *paths[], struct entry **dirs, struct entry **fil
 		n->nameLen = normalizePath(n->name);
 
 		// Fill out size-related members
-		if (!statNode(AT_FDCWD, &sbuf, n, hl)) {
+		if (!statNode(&sbuf, n)) {
 			fprintf(stderr, "Error resolving argument %s: %s\n", paths[i], strerror(errno));
-			free(n);
+			free_entry(n);
 			cands[i].node = NULL;
 			continue;
 		}
 		cands[i].abs = realpath(n->name, NULL);
 		if (cands[i].abs == NULL) {
 			fprintf(stderr, "Invalid argument %s: %s\n", paths[i], strerror(errno));
-			free(n);
+			free_entry(n);
 			cands[i].node = NULL;
 		} else {
 			cands[i].absLen = strlen(cands[i].abs);
@@ -1032,7 +1191,7 @@ makeSearchList(int count, char *paths[], struct entry **dirs, struct entry **fil
 				char sep = b->abs[a->absLen];
 				if (sep == '\0' || sep == '/') {
 					// a is a prefix for b
-					free(b->node);
+					free_entry(b->node);
 					b->node = NULL;
 				}
 			}
@@ -1056,7 +1215,7 @@ makeSearchList(int count, char *paths[], struct entry **dirs, struct entry **fil
 	free(cands);
 
 	if (root->unsearched_children == 1 && *files == NULL) {
-		free(root);
+		free_entry(root);
 		(*dirs)->parent = NULL;
 		return *dirs;
 	}
@@ -1164,16 +1323,9 @@ int main(int argc, char* argv[]) {
 		return 1;
 	}
 
-	const int startTableSize = 131072;
-	struct hl_table hl = {
-		.table = calloc(sizeof(struct hard_link), startTableSize),
-		.size = startTableSize,
-		.count = 0,
-	};
-	mtx_init(&hl.lock, mtx_plain);
 	struct entry *files = NULL;
 	struct entry *dirs = NULL;
-	struct entry *root = makeSearchList(argc - optind, &argv[optind], &dirs, &files, &hl);
+	struct entry *root = makeSearchList(argc - optind, &argv[optind], &dirs, &files);
 	if (root == NULL) {
 		return 1;
 	}
@@ -1183,9 +1335,7 @@ int main(int argc, char* argv[]) {
 	}
 
 	int size;
-	struct entry **final_entries = traverseDirs(dirs, files, &size, &hl);
-	mtx_destroy(&hl.lock);
-	free(hl.table);
+	struct entry **final_entries = traverseDirs(dirs, files, &size);
 
 	if (size != 0) {
 		struct indent_info *stack = (struct indent_info*)malloc(sizeof(struct indent_info) * (C.maxDepth+1));
@@ -1197,7 +1347,7 @@ int main(int argc, char* argv[]) {
 
 	// Cleanup
 	for (int i = 0; i < size; i++) {
-		free(final_entries[i]);
+		free_entry(final_entries[i]);
 	}
 	free(final_entries);
 	free(displayBuf);
