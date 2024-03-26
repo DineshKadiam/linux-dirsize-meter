@@ -467,15 +467,17 @@ mergeTables(struct entry *node, struct link_table *lt) {
 		if (lt->table[i].slotFilled != FILLED)
 			continue;
 		struct hard_link *newsl = lt_slot(parent, sl->dev, sl->ino);
-		if (newsl->slotFilled == EMPTY)
+		if (newsl->slotFilled == EMPTY) {
 			*newsl = *sl;
-		else {
-			newsl->extant_count = sl->nlink - sl->extant_count;
+			parent->count++;
+		} else {
+			newsl->extant_count -= sl->nlink - sl->extant_count;
 			node->size -= newsl->size; // Avoid double-counting from child and parent copies
+			node->shared_size -= newsl->size;
 			if (newsl->extant_count == 0) {
 				parent->deleted++;
 				parent->count--;
-				node->shared_size -= newsl->size;
+				node->shared_size -= newsl->size; // Subtract parent's copy
 				newsl->slotFilled = DEL;
 			}
 		}
