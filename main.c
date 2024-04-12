@@ -50,8 +50,22 @@ B U "Usage:" R " dut [OPTIONS]... [path]...\n"
 "column shows the portion of a directory that is shared with others (e.g. hard\n"
 "links).\n"
 "\n"
+"As an example, look at the following output:\n"
+" 4.0K  4.0K |- 2\n"
+" 4.0K    0B |- 3\n"
+" 4.0K  4.0K /- 1\n"
+"  12K    0B example\n"
+"\n"
+"Because files 1 and 2 are both listed in column 2 as having 4.0K shared with\n"
+"other files, and the root directory is shown as not having any data shared\n"
+"outside of it, we can assume that they are hard links of each other.\n"
+"\n"
+"This is reflected in the grand total in the first column of 'example' where we\n"
+"can see there is 4.0K for file 3, the root directory, and 4.0K shared between 1\n"
+"and 2.\n"
+"\n"
 B U "Useful environment variables:\n" R
-OPT("NO_COLOR", "set to any non-empty value to disable colorized output")
+"\t" B "NO_COLOR" R ": set to any non-empty value to disable colorized output\n"
 "\n"
 B U "Options:\n" R
 OPT("c", "disable colorized output")
@@ -64,7 +78,8 @@ OPTa("d", "depth limit to show in output")
 OPTa("i", "number of spaces for each level of indentation (default 2)")
 OPTa("n", "number of rows to show (default is terminal size - 10)")
 OPTa("t", "number of threads to use")
-OPT("h", "show this help message");
+OPT("h", "show this help message")
+OPT("v", "display version information");
 
 #undef L
 #undef R
@@ -72,6 +87,10 @@ OPT("h", "show this help message");
 #undef U
 #undef OPT
 #undef OPTa
+
+const char VERSION[] =
+"dut 0.1\n"
+"Please report bugs at https://codeberg.org/201984/dut/issues\n";
 
 struct Config {
 	int indentSize;
@@ -1237,7 +1256,7 @@ int main(int argc, char* argv[]) {
 	fillOutDefaults();
 	bool argErrors = false;
 	while (true) {
-		int c = getopt(argc, argv, "cClbpsi:n:d:t:h");
+		int c = getopt(argc, argv, "cClbpsi:n:d:t:hv");
 		if (c == -1)
 			break;
 
@@ -1293,6 +1312,9 @@ int main(int argc, char* argv[]) {
 			break;
 		case 'h':
 			printUsage();
+			return 0;
+		case 'v':
+			fwrite(VERSION, 1, sizeof(VERSION), stderr);
 			return 0;
 		case '?':
 			argErrors = true;
