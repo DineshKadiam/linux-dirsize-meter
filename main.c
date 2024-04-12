@@ -330,53 +330,6 @@ static uint32_t lt_check(struct link_table *lt, uint64_t dev, uint64_t ino, uint
 }
 
 //----------------------------------------------------------
-// Atomic-ish stack
-//----------------------------------------------------------
-
-struct stack {
-	struct entry *_Atomic head;
-	uint64_t padding[8];
-	atomic_flag lock;
-	uint64_t morePadding[8];
-};
-
-static struct entry *stack_pop(struct stack *s) {
-	if (atomic_flag_test_and_set_explicit(&s->lock, memory_order_acquire))
-		return NULL;
-
-	struct entry *newHead;
-	struct entry *currHead = atomic_load(&s->head);
-	do {
-		if (currHead == NULL) goto end;
-		newHead = currHead->next;
-	} while (!atomic_compare_exchange_weak(&s->head, &currHead, newHead));
-end:
-	atomic_flag_clear_explicit(&s->lock, memory_order_release);
-	return currHead;
-}
-
-static void stack_push_many(
-		struct stack *s,
-		struct entry *node,
-		struct entry **last_next,
-		int num,
-		_Atomic int *num_blocked_threads,
-		sem_t *sema) {
-	*last_next = atomic_load(&s->head);
-	while (!atomic_compare_exchange_weak(&s->head, last_next, node));
-
-	int blocked_threads = atomic_load(num_blocked_threads);
-	if (blocked_threads < num) num = blocked_threads;
-	for (int i = 0; i < num; i++) {
-		sem_post(sema);
-	}
-}
-
-static bool stack_is_empty(struct stack *s) {
-	return atomic_load_explicit(&s->head, memory_order_relaxed) == NULL;
-}
-
-//----------------------------------------------------------
 // Entry heap
 //----------------------------------------------------------
 
@@ -438,7 +391,8 @@ struct thread_data {
 	alignas(64) _Atomic int num_blocked_threads;
 	alignas(64) _Atomic bool encountered_errors;
 	alignas(64) sem_t worker_sem;
-	alignas(64) struct stack toList;
+	alignas(64) struct entry *_Atomic toList;
+	alignas(64) mtx_t lock;
 };
 
 // Data specific to each thread
@@ -453,7 +407,13 @@ struct thread_locals {
 
 static struct link_table *
 mergeTables(struct entry *node, struct link_table *lt) {
-	if (lt == NULL) {
+	if (lt == NULL || lt->count == 0) {
+		// If we're carrying up an empty table, just delete it
+		if (lt != NULL) {
+			mtx_unlock(&lt->lock);
+			lt_destroy(lt);
+			free(lt);
+		}
 		lt = node->lt;
 		if (lt != NULL) mtx_lock(&lt->lock);
 		return lt;
@@ -495,33 +455,30 @@ mergeTables(struct entry *node, struct link_table *lt) {
 // Sends this node to main, and updates parents sending them to main as well if
 // necessary
 static void finishNode(struct thread_locals *L, struct entry *node) {
-	struct entry *tmp = node;
-	node = node->parent;
-	uint64_t prev_size = tmp->size;
-	uint64_t prev_shared = tmp->shared_size;
-	struct link_table *lt = atomic_load(&tmp->lt);
-	tmp->lt = NULL;
+	int prev = 1;
+	struct link_table *lt = node->lt;
 	if (lt != NULL) mtx_lock(&lt->lock);
-	pushHeap(L->heap, &L->heap_filled, tmp);
-	// Inv: node needs to have totals adjusted by prev_size and lt
-	// lt's mutex is locked
-	while (node != NULL) {
-		atomic_fetch_add(&node->size, prev_size);
-		atomic_fetch_add(&node->shared_size, prev_shared);
-		lt = mergeTables(node, lt);
-		int prev = atomic_fetch_sub(&node->unsearched_children, 1);
-		if (prev != 1)
-			break;
-		prev_size = atomic_load_explicit(&node->size, memory_order_relaxed);
-		prev_shared = atomic_load_explicit(&node->shared_size, memory_order_relaxed);
-		tmp = node;
-		tmp->lt = NULL;
-		node = node->parent;
-		pushHeap(L->heap, &L->heap_filled, tmp);
+	// inv: lt is the link table of node, and its mutex is locked
+	while (node != NULL && prev == 1) {
+		struct entry *parent = node->parent;
+		if (parent != NULL) {
+			atomic_fetch_add(&parent->size, node->size);
+			atomic_fetch_add(&parent->shared_size, node->shared_size);
+			lt = mergeTables(parent, lt);
+			prev = atomic_fetch_sub(&parent->unsearched_children, 1);
+		} else if (lt != NULL) {
+			// Free the root node's link table
+			mtx_unlock(&lt->lock);
+			lt_destroy(lt);
+			free(lt);
+			lt = NULL;
+		}
+		node->lt = NULL;
+		pushHeap(L->heap, &L->heap_filled, node);
+		node = parent;
 	}
 	if (lt != NULL) mtx_unlock(&lt->lock);
 }
-
 
 // From getdents(2)
 struct linux_dirent64 {
@@ -661,7 +618,15 @@ static void doLs(struct thread_locals *const L, struct entry *const node) {
 	// deal with output
 	atomic_store(&node->unsearched_children, children);
 	if (dirs != NULL) {
-		stack_push_many(&T->toList, dirs, dirsLastPtr, children, &T->num_blocked_threads, &T->worker_sem);
+		*dirsLastPtr = atomic_load(&T->toList);
+		while (!atomic_compare_exchange_weak(&T->toList, dirsLastPtr, dirs));
+
+		int threads_to_wake = atomic_load(&T->num_blocked_threads);
+		if (children < (uint64_t)threads_to_wake) threads_to_wake = children;
+		threads_to_wake--; // We'll still be awake
+		for (int i = 0; i < threads_to_wake; i++) {
+			sem_post(&T->worker_sem);
+		}
 	} else {
 		finishNode(L, node);
 	}
@@ -679,14 +644,19 @@ static int thread_func(void *data) {
 	L->heap_filled = 0;
 
 	while (true) {
-		struct entry *node;
-		if (NULL != (node = stack_pop(&T->toList))) {
+		mtx_lock(&T->lock);
+		struct entry *node = atomic_load(&T->toList);
+		while (node != NULL && !atomic_compare_exchange_weak(&T->toList, &node, node->next));
+		mtx_unlock(&T->lock);
+
+		if (node != NULL) {
 			doLs(L, node);
 			continue;
 		}
 
 		int oldBlocked = atomic_fetch_add(&T->num_blocked_threads, 1);
-		if (!stack_is_empty(&T->toList)) {
+		// Recheck to avoid deadlock
+		if (atomic_load(&T->toList) != NULL) {
 			atomic_fetch_sub(&T->num_blocked_threads, 1);
 			continue;
 		}
@@ -712,11 +682,12 @@ static int thread_func(void *data) {
 static struct entry **
 traverseDirs(struct entry *dirs, struct entry *files, int *res_size) {
 	struct thread_data T = {
-		.toList = {.head = dirs, .lock = ATOMIC_FLAG_INIT},
+		.toList = dirs,
 		.encountered_errors = false,
 		.num_blocked_threads = 0,
 	};
 	sem_init(&T.worker_sem, 0, 0);
+	mtx_init(&T.lock, mtx_plain);
 
 	// Spawn I/O threads
 	struct thread_locals *locals = (struct thread_locals*)malloc(sizeof(struct thread_locals) * C.threads);
@@ -762,6 +733,7 @@ traverseDirs(struct entry *dirs, struct entry *files, int *res_size) {
 	free(threads);
 	free(locals);
 	sem_destroy(&T.worker_sem);
+	mtx_destroy(&T.lock);
 	*res_size = heap_filled;
 	return heap;
 }
