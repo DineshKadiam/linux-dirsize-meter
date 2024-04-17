@@ -21,7 +21,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>
 #include <asm/termbits.h>
 #include <ctype.h>
 #include <dirent.h>
-#include <emmintrin.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
