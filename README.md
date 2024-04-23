@@ -64,6 +64,8 @@ gcc -O3 -flto main.c -o dut
 ```
 To install, copy the `dut` executable to a directory on your PATH, e.g. `/usr/local/bin`.
 
+If get linker errors about missing symbols, you may need to add the `-pthread` option to gcc.
+
 ## Benchmarks
 
 `dut` is remarkably fast, but it doesn't win in all cases. It loses to a couple programs when
