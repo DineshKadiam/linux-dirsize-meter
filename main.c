@@ -16,6 +16,16 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>
 */
 
+/*
+How to build dut:
+$ gcc -O3 -flto main.c -o dut
+With warnings:
+$ gcc -O3 -flto main.c -o dut -Wall -Wextra -pedantic-errors -std=c11
+
+If you get linker errors about missing symbols and you have an older glibc,
+adding -pthread should fix it.
+*/
+
 #define _XOPEN_SOURCE 500
 #define _GNU_SOURCE
 #include <asm/termbits.h>
@@ -165,7 +175,7 @@ static void free_entry(struct entry *ent) {
 // Utility functions
 //----------------------------------------------------------
 
-static void printUsage() {
+static void printUsage(void) {
 	if (!C.color) {
 		// Strip out all escapes
 		char buf[2048];
@@ -329,7 +339,7 @@ static struct hard_link *lt_slot(struct link_table *lt, uint64_t dev, uint64_t i
 		struct hard_link *oldTable = lt->table;
 		lt->size = (size_t)nextPwrOf2(lt->count);
 		if (lt->size < 16) lt->size = 16;
-		lt->table = calloc(sizeof(struct link_table), lt->size);
+		lt->table = calloc(lt->size, sizeof(struct link_table));
 		lt->deleted = 0;
 		if (oldTable != NULL) {
 			for (size_t i = 0; i < oldSize; i++) {
