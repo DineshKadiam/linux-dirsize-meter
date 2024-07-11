@@ -58,13 +58,17 @@ The full list of options can be seen with `dut -h`.
 
 ## How to build
 
-`dut` is a single source file, so all you need is a C11 compiler:
+`dut` comes with a Makefile, so to install it on your system run:
 ```
-gcc -O3 -flto main.c -o dut
+git clone https://codeberg.org/201984/dut.git
+sudo make install
 ```
-To install, copy the `dut` executable to a directory on your PATH, e.g. `/usr/local/bin`.
 
-If get linker errors about missing symbols, you may need to add the `-pthread` option to gcc.
+The default install location is `/usr/local/bin`, but this can be changed by specifying a
+`PREFIX` value. For example, to install to `~/.local/bin`:
+```
+make install PREFIX=$HOME/.local
+```
 
 ## Benchmarks
 
