@@ -1346,7 +1346,7 @@ int main(int argc, char* argv[]) {
 			printUsage();
 			return 0;
 		case 'v':
-			fwrite(VERSION, 1, sizeof(VERSION), stderr);
+			fputs(VERSION, stderr);
 			return 0;
 		case '?':
 			argErrors = true;
