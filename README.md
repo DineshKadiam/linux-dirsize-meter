@@ -2,7 +2,7 @@
 
 ## Features
 - Accurate counting of hard links with an output inspired by NCDU.
-- Pure ASCII output which is fully compatible with the plain Linux tty.
+- ASCII-art disk usage tree that is fully compatible with the Linux tty.
 - Configurable output format. Changing the maximum depth of files shown is a simple command-line
 argument.
 
