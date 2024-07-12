@@ -23,7 +23,7 @@ With warnings:
 $ gcc -O3 -flto main.c -o dut -Wall -Wextra -pedantic-errors -std=c11
 
 If you get linker errors about missing symbols and you have an older glibc,
-adding -pthread should fix it.
+adding -pthread -latomic should fix it.
 */
 
 #define _XOPEN_SOURCE 500
@@ -47,6 +47,7 @@ adding -pthread should fix it.
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/syscall.h>
 #include <threads.h>
 #include <unistd.h>
 
@@ -626,7 +627,7 @@ static void doLs(struct thread_locals *const L, struct entry *const node) {
 	size_t dents_len = 0;
 	while (true) {
 		void *wr = (void*)((char*)L->scr + dents_len);
-		ssize_t result = getdents64(fd, wr, L->scr_size - dents_len);
+		ssize_t result = syscall(SYS_getdents64, fd, wr, L->scr_size - dents_len);
 		if (result == -1) {
 			if (errno == EINVAL) {
 				L->scr_size *= 2;
