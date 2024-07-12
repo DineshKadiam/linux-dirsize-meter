@@ -40,14 +40,14 @@ adding -pthread -latomic should fix it.
 #include <stdalign.h>
 #include <stdatomic.h>
 #include <stdbool.h>
-#include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
-#include <sys/types.h>
 #include <sys/syscall.h>
+#include <sys/types.h>
 #include <threads.h>
 #include <unistd.h>
 
