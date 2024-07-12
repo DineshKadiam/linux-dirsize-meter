@@ -190,9 +190,10 @@ static void printUsage(void) {
 			buf[w++] = USAGE[r++];
 		}
 		buf[w] = '\0';
-		fprintf(stderr, "%s", buf);
+		fputs(buf, stderr);
 	} else {
-		fprintf(stderr, "%s", USAGE);
+		// gcc optimizes this to fwrite
+		fputs(USAGE, stderr);
 	}
 }
 
@@ -1287,6 +1288,7 @@ int main(int argc, char* argv[]) {
 	// Parse arguments
 	fillOutDefaults();
 	bool argErrors = false;
+	bool printHelp = false;
 	while (true) {
 		int c = getopt(argc, argv, "cClbpsi:n:d:t:hv");
 		if (c == -1)
@@ -1343,8 +1345,10 @@ int main(int argc, char* argv[]) {
 			}
 			break;
 		case 'h':
-			printUsage();
-			return 0;
+			// Continue parsing options in case -c is specified and colorized output
+			// should be disabled
+			printHelp = true;
+			break;
 		case 'v':
 			fputs(VERSION, stderr);
 			return 0;
@@ -1352,9 +1356,9 @@ int main(int argc, char* argv[]) {
 			argErrors = true;
 		}
 	}
-	if (argErrors) {
+	if (argErrors || printHelp) {
 		printUsage();
-		return 1;
+		return argErrors;
 	}
 
 	struct entry *files = NULL;
