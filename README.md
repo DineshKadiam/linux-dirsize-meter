@@ -61,6 +61,7 @@ The full list of options can be seen with `dut -h`.
 `dut` comes with a Makefile, so to install it on your system run:
 ```
 git clone https://codeberg.org/201984/dut.git
+cd dut/
 sudo make install
 ```
 
