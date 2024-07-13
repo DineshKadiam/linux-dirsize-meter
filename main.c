@@ -1,5 +1,5 @@
 /*
-dut - A disk usage calcuator for Linux.
+dut - A disk usage calculator for Linux.
 Copyright (C) 2024
 
 This program is free software: you can redistribute it and/or modify
