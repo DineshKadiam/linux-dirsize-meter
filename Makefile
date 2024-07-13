@@ -1,8 +1,8 @@
 # Use this for warnings:
-# CFLAGS = -O3 -flto -Wall -Wextra -std=c11 -pedantic
-CFLAGS = -O3 -flto
-LDFLAGS = -pthread -latomic
-PREFIX = /usr/local
+# CFLAGS ?= -O3 -Wall -Wextra -std=c11 -pedantic
+CFLAGS ?= -O3
+LDFLAGS ?= -pthread -latomic
+PREFIX ?= /usr/local
 
 all: dut
 
