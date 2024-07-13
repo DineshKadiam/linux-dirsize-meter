@@ -1,0 +1,105 @@
+.Dd July 13, 2023
+.Dt DUT 1
+.Os
+.
+.Sh NAME
+.Nm dut
+.Nd disk usage calculator
+.
+.Sh SYNOPSIS
+.Nm
+.Op Fl cClsbphv
+.Op Fl d Ar depth
+.Op Fl i Ar indent
+.Op Fl n Ar rows
+.Op Fl t Ar threads
+.Op Ar path...
+.
+.Sh DESCRIPTION
+.Nm
+is a configurable, fast disk usage calculator for Linux, capable of
+de-duplicating hardlinks.
+.
+.Pp
+If invoked without an argument,
+.Nm
+will search the current working directory.  Otherwise,
+.Nm
+will traverse all directories listed in
+.Ar path... .
+.
+.Sh OPTIONS
+.Bl -tag -width Ds
+.
+.It Fl c
+Disable colorized output.  This has the same effect as a non-empty
+value in the
+.Ev NO_COLOR
+environmental variable.
+.
+.It Fl C
+Force colorized output.  This overrides the environmental variable
+.Ev NO_COLOR .
+.
+.It Fl l
+Count every instance of a hard link.
+.
+.It Fl b
+Show sizes in plain bytes intead of human readable format.
+.
+.It Fl s
+Use size of files instead of size on disk.
+.
+.It Fl p
+Display full path of files in the tree.
+.
+.It Fl d Ar depth
+Limit the
+.Ar depth
+of the traversed file system in the output.
+.
+.It Fl i Ar indentation
+Specify the number of spaces for each level of
+.Ar indentation .
+The default is 2.
+.
+.It Fl n Ar rows
+Specify the number of
+.Ar rows
+to show.  The default is 10 rows less than the terminal size.
+.
+.It Fl t Ar threads
+Number of
+.Ar threads
+to use.  The default is the number online processors.  See also
+.Xr get_nprocs_conf 3 .
+.
+.It Fl h
+Display a help message.
+.
+.It Fl v
+Display version information.
+.
+.El
+.
+.Sh ENVIRONMENT
+If the
+.Ev NO_COLOR
+environmental variable has a non-empty value, then the output will not
+include any color
+.Po
+see the
+.Fl c
+option and also
+.Lk https://no-color.org/
+.Pc .
+.Sh EXIT STATUS
+.Ex -std
+.
+.Sh SEE ALSO
+.Xr du 1 ,
+.Xr ncdu 1 ,
+.Xr dua 1 ,
+.Xr pdu 1 ,
+.Xr dust 1 ,
+.Xr gdu 1
