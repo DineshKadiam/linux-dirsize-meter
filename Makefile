@@ -13,8 +13,8 @@ clean:
 	rm -f dut
 
 install: all
-	install -D dut $(PREFIX)/bin
-	install -D dut.1 $(PREFIX)/share/man/man1/
+	install -Dt $(PREFIX)/bin/ dut
+	install -Dt $(PREFIX)/share/man/man1/ dut.1
 
 uninstall:
 	rm -f $(PREFIX)/bin/dut
