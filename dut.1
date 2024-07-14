@@ -17,16 +17,59 @@
 .
 .Sh DESCRIPTION
 .Nm
-is a configurable, fast disk usage calculator for Linux, capable of
+is a multi-threaded disk usage calculator for Linux, capable of
 de-duplicating hardlinks.
 .
 .Pp
 If invoked without an argument,
 .Nm
-will search the current working directory.  Otherwise,
+will calculate disk usage for the current working directory.  Otherwise,
 .Nm
-will traverse all directories listed in
+will do so for all directories listed in
 .Ar path... .
+.
+.Ss Output Format
+.Nm
+shows a summary of all the files reachable from
+.Ar path...
+in a tree-like format.  Specifying multiple directories in
+.Ar path...
+will result in a dummy
+.Dq Pq total
+tree node being created at the bottom of the output.  The output has two
+columns: a size column that displays the total size taken up by this
+entry, and a
+.Dq shared space
+column that indicates the amount of this total taken up by files
+hardlinked to other places in the filesystem.
+.Pp
+In the below example,
+.Nm
+displays the disk usage of
+.Pa example
+as 12 kilobytes, consisting of files
+.Pa 1 , 2 ,
+and
+.Pa 3 . 1
+and
+.Pa 2
+are indicated by the second column to be hardlinks, due to having a
+non-zero shared size.  Because
+.Pa example Ap s
+second column is 0, we can assume that they are hardlinks of each
+other, since they are the only hardlinks inside of
+.Pa example .
+If they were instead linked to files elsewhere on the filesystem,
+.Pa example Ap s
+shared size column would instead show that 8K is shared with other
+directories.
+.Bd -literal -offset indent
+$ dut ./example
+ 4.0K  4.0K |- 2
+ 4.0K    0B |- 3
+ 4.0K  4.0K /- 1
+  12K    0B example
+.Ed
 .
 .Sh OPTIONS
 .Bl -tag -width Ds
@@ -42,37 +85,44 @@ Force colorized output.  This overrides the environmental variable
 .Ev NO_COLOR .
 .
 .It Fl l
-Count every instance of a hard link.
+Don't deduplicate hardlinks when traversing the filesystem.  This option
+causes
+.Nm
+to only show the first column of output.
 .
 .It Fl b
 Show sizes in plain bytes intead of human readable format.
 .
 .It Fl s
-Use size of files instead of size on disk.
+Count size of files instead of size on disk.
 .
 .It Fl p
 Display full path of files in the tree.
 .
 .It Fl d Ar depth
-Limit the
+Limit the depth of the displayed tree to
 .Ar depth
-of the traversed file system in the output.
+levels.
 .
 .It Fl i Ar indentation
 Specify the number of spaces for each level of
-.Ar indentation .
-The default is 2.
+.Ar indentation
+in the displayed tree.  The default is 2.
 .
 .It Fl n Ar rows
 Specify the number of
 .Ar rows
-to show.  The default is 10 rows less than the terminal size.
+to show.  The default is the terminal height minus 10.
 .
 .It Fl t Ar threads
 Number of
 .Ar threads
-to use.  The default is the number online processors.  See also
-.Xr get_nprocs_conf 3 .
+to use for scanning the filesystem.  The default is 4 or the number of
+online processors, whichever is greater.
+.Po
+see
+.Xr get_nprocs_conf 3
+.Pc
 .
 .It Fl h
 Display a help message.
@@ -99,7 +149,5 @@ option and also
 .Sh SEE ALSO
 .Xr du 1 ,
 .Xr ncdu 1 ,
-.Xr dua 1 ,
-.Xr pdu 1 ,
 .Xr dust 1 ,
 .Xr gdu 1
