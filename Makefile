@@ -14,6 +14,8 @@ clean:
 
 install: all
 	install -D dut $(PREFIX)/bin
+	install -D dut.1 $(PREFIX)/share/man/man1/
 
 uninstall:
 	rm -f $(PREFIX)/bin/dut
+	rm -f $(PREFIX)/share/man/man1/dut.1
