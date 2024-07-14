@@ -13,9 +13,9 @@ clean:
 	rm -f dut
 
 install: all
-	install -Dt $(PREFIX)/bin/ dut
-	install -Dt $(PREFIX)/share/man/man1/ dut.1
+	install -vDm 0755 -t $(DESTDIR)$(PREFIX)/bin/ dut
+	install -vDm 0644 -t $(DESTDIR)$(PREFIX)/share/man/man1/ dut.1
 
 uninstall:
-	rm -f $(PREFIX)/bin/dut
-	rm -f $(PREFIX)/share/man/man1/dut.1
+	rm -f $(DESTDIR)$(PREFIX)/bin/dut
+	rm -f $(DESTDIR)$(PREFIX)/share/man/man1/dut.1
