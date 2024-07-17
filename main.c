@@ -151,15 +151,21 @@ static struct Config C = {
 
 // All the data about individual files and directories is in this struct
 struct entry {
-	_Atomic uint64_t unsearched_children;
+	union {
+		_Atomic uint64_t unsearched_children; // for traversal
+		size_t num_children; // for output rendering
+	};
 	// data only under this entry = size - shared_size
 	_Atomic uint64_t size;
 	_Atomic uint64_t shared_size;
 	uint64_t depth;
-	size_t nameLen; // Does NOT include null terminator!
-	struct link_table *_Atomic lt;
+	union {
+		struct link_table *_Atomic lt; // Used during traversal
+		struct entry *children; // Used for output rendering
+	};
 	struct entry *parent;
 	struct entry *next; // For use in stacks
+	size_t nameLen; // Does NOT include null terminator!
 	mode_t st_mode;
 	char name[];
 };
@@ -199,7 +205,7 @@ static void printUsage(void) {
 }
 
 // Custom buffering to beat stdio performance by ~8%
-#define DISPBUFSIZE 16384
+#define DISPBUFSIZE 131072
 // One buffer to avoid the cost of reallocations
 static char displayBuf[DISPBUFSIZE];
 // Size of stored data (no null terminator)
@@ -729,6 +735,7 @@ static int thread_func(void *data) {
 		mtx_unlock(&T->lock);
 
 		if (node != NULL) {
+			node->next = NULL;
 			doLs(L, node);
 			continue;
 		}
@@ -759,7 +766,7 @@ static int thread_func(void *data) {
 }
 
 static struct entry **
-traverseDirs(struct entry *dirs, struct entry *files, int *res_size) {
+traverseDirs(struct entry *dirs, struct entry *files, size_t *res_size) {
 	struct thread_data T = {
 		.toList = dirs,
 		.encountered_errors = false,
@@ -1041,15 +1048,8 @@ struct indent_info {
 	int childs;
 };
 
-static void
-renderDisplay(struct entry *root, struct indent_info *stack, int depth, int size, struct entry **arr) {
+static void renderEntry(struct entry *node, size_t depth) {
 	// Find children, remove them from the array and sort them
-	stack[depth].childs = 0;
-	for (int i = 0; i < size; i++) {
-		if (arr[i]->parent == root) {
-			stack[depth].childs++;
-		}
-	}
 	struct entry **children = (struct entry**)malloc(sizeof(struct entry*) * stack[depth].childs);
 	int j = 0;
 	for (int i = 0; i < size; i++) {
@@ -1098,6 +1098,106 @@ renderDisplay(struct entry *root, struct indent_info *stack, int depth, int size
 	wr("\n");
 
 	free(children);
+}
+
+struct render_stack {
+	size_t arrPos;
+	size_t arrLen; // same as entry->num_children. FIXME: Needed?
+	size_t i;
+};
+
+static int qsort_entry_compare(const void *a, const void *b) {
+	return (*(struct entry**)a)->size - (*(struct entry**)b)->size;
+}
+
+static void stk_init(struct render_stack *stk, struct entry *node, struct entry **arena, size_t arrPos) {
+	stk->arrPos = arrPos;
+	stk->arrLen = node->num_children;
+	stk->i = 0;
+	size_t i = 0;
+	for (struct entry *e = node->children; e != NULL; e = e->next, i++) {
+		arena[arrPos + i] = e;
+	}
+	qsort(arena + arrPos, stk->arrLen, sizeof(struct entry*), qsort_entry_compare);
+}
+
+static void renderDisplay(struct entry *root, size_t num_ents, struct entry *const *arr) {
+	// Have array of all entries in random order
+	// Want: each node in ->next list of parent
+	//       some way of keeping track of state while recursing
+	//       some way of sorting children of Current Node
+	if (root->lt) {
+		lt_destroy(root->lt);
+		free(root->lt);
+		root->children = NULL; // other union field
+	}
+	// TODO: This pass necessary?
+	for (size_t i = 0; i < num_ents; i++) {
+		if (arr[i]->lt) {
+			fprintf(stderr, "found lt\n");
+		}
+		if (arr[i]->unsearched_children) {
+			fprintf(stderr, "unsearched_children\n");
+		}
+		if (arr[i]->next) {
+			fprintf(stderr, "next not blank\n");
+		}
+		// UB to not do this?
+		arr[i]->children = NULL;
+		arr[i]->num_children = 0;
+	}
+	// Trick: put linked list of children in each node in one pass
+	size_t max_depth = 0;
+	for (size_t i = 0; i < num_ents; i++) {
+		if (!arr[i]->parent) continue;
+		arr[i]->next = arr[i]->parent->children;
+		arr[i]->parent->children = arr[i];
+		arr[i]->parent->num_children++;
+		if (arr[i]->depth > max_depth) max_depth = arr[i]->depth;
+	}
+	max_depth += 2; // FIXME
+	// manual stack instead of recursion
+	// TODO: depth of root files is what?
+	// for each node need:
+	// - space to store children, then sort
+	// - "recurse" into children, come back
+	// - walk up stack to print sparse tree string
+	// - print name, go back to parent
+	struct entry **arena = (struct entry**)malloc(sizeof(struct entry*) * num_ents);
+	struct render_stack *stk = (struct render_stack*)malloc(sizeof(struct render_stack) * max_depth);
+
+	// inv: stk[depth] == current state, arena[arrPos..arrLen] already set up and sorted, stk[depth-1].i is 1 too high
+	// inv: stk[depth] NOT filled out, need to sort children and display
+	stk_init(stk, root, arena, 0);
+
+	ssize_t depth = 0;
+	while (depth >= 0) {
+		struct render_stack *s = &stk[depth];
+		if (s->i == s->arrLen) {
+			// snoop current entry out of previous frame, or assume it's root
+			struct entry *e = root;
+			if (depth > 0) {
+				e = arena[stk[depth-1].arrPos + stk[depth-1].i - 1];
+			}
+			// LEAVING OFF POINT: print entry
+
+			// "return" to parent frame
+			depth--;
+			continue;
+		}
+
+		// Dump child's children into arena, i++, recurse
+		struct render_stack *cstk = &stk[depth+1];
+		struct entry *c = arena[s->arrPos + s->i];
+		stk_init(cstk, c, arena, s->arrPos + s->arrLen);
+
+		// recurse!
+		depth++;
+		s->i++;
+	}
+
+	free(arena);
+	free(stk);
 }
 
 //----------------------------------------------------------
@@ -1396,18 +1496,16 @@ int main(int argc, char* argv[]) {
 		initLsColors();
 	}
 
-	int size;
-	struct entry **final_entries = traverseDirs(dirs, files, &size);
+	size_t num_ents;
+	struct entry **final_entries = traverseDirs(dirs, files, &num_ents);
 
-	if (size != 0) {
-		struct indent_info *stack = (struct indent_info*)malloc(sizeof(struct indent_info) * (C.maxDepth+1));
-		renderDisplay(root, stack, 0, size, final_entries);
+	if (num_ents != 0) {
+		renderDisplay(root, num_ents, final_entries);
 		wrFlush();
-		free(stack);
 	}
 
 	// Cleanup
-	for (int i = 0; i < size; i++) {
+	for (int i = 0; i < num_ents; i++) {
 		free_entry(final_entries[i]);
 	}
 	free(final_entries);
