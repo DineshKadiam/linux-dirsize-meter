@@ -151,6 +151,7 @@ static struct Config C = {
 
 // All the data about individual files and directories is in this struct
 struct entry {
+	// These unions are to reuse fields that aren't needed once traversal is complete
 	union {
 		_Atomic uint64_t unsearched_children; // for traversal
 		size_t num_children; // for output rendering
@@ -204,8 +205,8 @@ static void printUsage(void) {
 	}
 }
 
-// Custom buffering to beat stdio performance by ~8%
-#define DISPBUFSIZE 131072
+// Custom buffering to beat stdio performance by a couple percent
+#define DISPBUFSIZE 16384
 // One buffer to avoid the cost of reallocations
 static char displayBuf[DISPBUFSIZE];
 // Size of stored data (no null terminator)
@@ -213,7 +214,7 @@ static size_t displayPos = 0;
 // Dump buffer to stdout
 static void wrFlush(void) {
 	ssize_t pos = 0;
-	while (pos < (size_t)displayPos) {
+	while (pos < (ssize_t)displayPos) {
 		ssize_t res = write(STDOUT_FILENO, displayBuf + pos, displayPos - pos);
 		if (res == -1) {
 			perror("could not write to stdout");
@@ -268,22 +269,6 @@ static bool parseInt(const char *input, int *output, const char *paramName) {
 
 	*output = res;
 	return true;
-}
-
-// Insert entry into sorted array
-static void insertSorted(struct entry *thing, int size, struct entry **arr) {
-	int i = size;
-	// Set i to where thing needs to go
-	while (i > 0 && thing->size < arr[i-1]->size) i--;
-	// shift everything up
-	while (i < size) {
-		struct entry *tmp = thing;
-		thing = arr[i];
-		arr[i] = tmp;
-		i++;
-	}
-	// last element
-	arr[i] = thing;
 }
 
 static bool entryComparator(const struct entry *a, const struct entry *b) {
@@ -1042,39 +1027,25 @@ static void wrSize(uint64_t size) {
 	}
 }
 
-struct indent_info {
-	// Idx is the index of current node in parent's level. 0 = first thing printed
-	int idx;
-	int childs;
+// "stack" being used instead of real recursion
+struct render_stack {
+	size_t arrPos;
+	size_t arrLen;
+	size_t i;
 };
 
-static void renderEntry(struct entry *node, size_t depth) {
-	// Find children, remove them from the array and sort them
-	struct entry **children = (struct entry**)malloc(sizeof(struct entry*) * stack[depth].childs);
-	int j = 0;
-	for (int i = 0; i < size; i++) {
-		if (arr[i]->parent == root) {
-			// Delete from arr?
-			insertSorted(arr[i], j, children);
-			j++;
-		}
-	}
-
-	// render children
-	for (stack[depth].idx = 0; stack[depth].idx < stack[depth].childs; stack[depth].idx++) {
-		renderDisplay(children[stack[depth].idx], stack, depth + 1, size, arr);
-	}
-
+static void renderEntry(struct entry *node, size_t depth, struct render_stack *stk) {
 	// render self, starting with size
-	wrSize(root->size);
+	wrSize(node->size);
 	if (C.dedupHardLinks)
-		wrSize(root->shared_size);
+		wrSize(node->shared_size);
 
 	// Indentation
-	int i = 0;
-	while (i <= depth - 2) {
+	// TODO someday: Store a string of all previous levels and just print that
+	size_t i = 0;
+	while (i + 2 <= depth) {
 		// Sparse tree. Only put a | if there's stuff after it
-		if (stack[i].idx == 0) {
+		if (stk[i].i == 1) {
 			wr(" ");
 		} else {
 			wr("|");
@@ -1087,29 +1058,25 @@ static void renderEntry(struct entry *node, size_t depth) {
 
 	// tree form
 	if (depth > 0) {
-		if (stack[depth-1].idx == stack[depth-1].childs - 1) {
+		if (stk[depth-1].i == stk[depth-1].arrLen) {
 			wr("/- ");
 		} else {
 			wr("|- ");
 		}
 	}
 
-	wrFileName(root);
+	wrFileName(node);
 	wr("\n");
-
-	free(children);
 }
-
-struct render_stack {
-	size_t arrPos;
-	size_t arrLen; // same as entry->num_children. FIXME: Needed?
-	size_t i;
-};
 
 static int qsort_entry_compare(const void *a, const void *b) {
-	return (*(struct entry**)a)->size - (*(struct entry**)b)->size;
+	int64_t res = (int64_t)(*(struct entry**)a)->size - (int64_t)(*(struct entry**)b)->size;
+	if (res > 0) return 1;
+	if (res < 0) return -1;
+	return 0;
 }
 
+// Dump a struct entry's children at arena[arrPos], after sorting it
 static void stk_init(struct render_stack *stk, struct entry *node, struct entry **arena, size_t arrPos) {
 	stk->arrPos = arrPos;
 	stk->arrLen = node->num_children;
@@ -1122,31 +1089,13 @@ static void stk_init(struct render_stack *stk, struct entry *node, struct entry 
 }
 
 static void renderDisplay(struct entry *root, size_t num_ents, struct entry *const *arr) {
-	// Have array of all entries in random order
-	// Want: each node in ->next list of parent
-	//       some way of keeping track of state while recursing
-	//       some way of sorting children of Current Node
-	if (root->lt) {
-		lt_destroy(root->lt);
-		free(root->lt);
-		root->children = NULL; // other union field
-	}
-	// TODO: This pass necessary?
 	for (size_t i = 0; i < num_ents; i++) {
-		if (arr[i]->lt) {
-			fprintf(stderr, "found lt\n");
-		}
-		if (arr[i]->unsearched_children) {
-			fprintf(stderr, "unsearched_children\n");
-		}
-		if (arr[i]->next) {
-			fprintf(stderr, "next not blank\n");
-		}
 		// UB to not do this?
 		arr[i]->children = NULL;
 		arr[i]->num_children = 0;
 	}
 	// Trick: put linked list of children in each node in one pass
+	//        this allows rendering each entry to be O(log n) instead of O(n)
 	size_t max_depth = 0;
 	for (size_t i = 0; i < num_ents; i++) {
 		if (!arr[i]->parent) continue;
@@ -1155,21 +1104,15 @@ static void renderDisplay(struct entry *root, size_t num_ents, struct entry *con
 		arr[i]->parent->num_children++;
 		if (arr[i]->depth > max_depth) max_depth = arr[i]->depth;
 	}
-	max_depth += 2; // FIXME
-	// manual stack instead of recursion
-	// TODO: depth of root files is what?
-	// for each node need:
-	// - space to store children, then sort
-	// - "recurse" into children, come back
-	// - walk up stack to print sparse tree string
-	// - print name, go back to parent
+	// 1 for root nodes, 1 for (total)
+	max_depth += 2;
+
 	struct entry **arena = (struct entry**)malloc(sizeof(struct entry*) * num_ents);
 	struct render_stack *stk = (struct render_stack*)malloc(sizeof(struct render_stack) * max_depth);
 
-	// inv: stk[depth] == current state, arena[arrPos..arrLen] already set up and sorted, stk[depth-1].i is 1 too high
-	// inv: stk[depth] NOT filled out, need to sort children and display
 	stk_init(stk, root, arena, 0);
-
+	// inv: stk[depth] == current state, arena[arrPos..arrLen] already set up and sorted, stk[depth-1].i is 1 too high
+	// This is fake recursion to avoid stack overflows. The "stack" is allocated on the heap at stk
 	ssize_t depth = 0;
 	while (depth >= 0) {
 		struct render_stack *s = &stk[depth];
@@ -1179,7 +1122,7 @@ static void renderDisplay(struct entry *root, size_t num_ents, struct entry *con
 			if (depth > 0) {
 				e = arena[stk[depth-1].arrPos + stk[depth-1].i - 1];
 			}
-			// LEAVING OFF POINT: print entry
+			renderEntry(e, depth, stk);
 
 			// "return" to parent frame
 			depth--;
@@ -1505,8 +1448,10 @@ int main(int argc, char* argv[]) {
 	}
 
 	// Cleanup
-	for (int i = 0; i < num_ents; i++) {
-		free_entry(final_entries[i]);
+	for (size_t i = 0; i < num_ents; i++) {
+		// Plain old free instead of free_entry, since all ->lt fields
+		// have already been destroyed
+		free(final_entries[i]);
 	}
 	free(final_entries);
 	freeLsColors();
