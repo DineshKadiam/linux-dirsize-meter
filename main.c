@@ -28,28 +28,25 @@ adding -pthread -latomic should fix it.
 
 #define _XOPEN_SOURCE 500
 #define _GNU_SOURCE
-#include <asm/termbits.h>
-#include <ctype.h>
-#include <dirent.h>
+#include <asm/termbits.h> // TIOCGWINSZ
+#include <ctype.h>        // isalpha(3)
 #include <errno.h>
-#include <fcntl.h>
-#include <getopt.h>
-#include <inttypes.h>
-#include <limits.h>
-#include <semaphore.h>
-#include <stdalign.h>
-#include <stdatomic.h>
+#include <fcntl.h>        // open(2)
+#include <inttypes.h>     // PRIu64
+#include <limits.h>       // realpath(3)
+#include <semaphore.h>    // sem_post(3), etc.
+#include <stdalign.h>     // alignas()
+#include <stdatomic.h>    // atomic_compare_exchange_strong, etc.
 #include <stdbool.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include <stdint.h>       // uint64_t, etc.
+#include <stdio.h>        // fprintf
+#include <stdlib.h>       // malloc
+#include <string.h>       // memcpy
 #include <sys/ioctl.h>
-#include <sys/stat.h>
-#include <sys/syscall.h>
-#include <sys/types.h>
-#include <threads.h>
-#include <unistd.h>
+#include <sys/stat.h>     // statx(2)
+#include <sys/syscall.h>  // syscall wrapper for getdents64
+#include <threads.h>      // thrd_create(3), etc.
+#include <unistd.h>       // close(2), write(2)
 
 //----------------------------------------------------------
 // Forward definitions
