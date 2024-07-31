@@ -195,10 +195,10 @@ static void printUsage(void) {
 			buf[w++] = USAGE[r++];
 		}
 		buf[w] = '\0';
-		fputs(buf, stderr);
+		fwrite(buf, 1, w, stdout);
 	} else {
 		// gcc optimizes this to fwrite
-		fputs(USAGE, stderr);
+		fputs(USAGE, stdout);
 	}
 }
 
@@ -1414,7 +1414,7 @@ int main(int argc, char* argv[]) {
 			printHelp = true;
 			break;
 		case 'v':
-			fputs(VERSION, stderr);
+			fputs(VERSION, stdout);
 			return 0;
 		case '?':
 			argErrors = true;
