@@ -34,6 +34,7 @@ adding -pthread -latomic should fix it.
 #include <fcntl.h>        // open(2)
 #include <inttypes.h>     // PRIu64
 #include <limits.h>       // realpath(3)
+#include <sched.h>        // sched_getaffinity(2), CPU_COUNT_S(3)
 #include <semaphore.h>    // sem_post(3), etc.
 #include <stdalign.h>     // alignas()
 #include <stdatomic.h>    // atomic_compare_exchange_strong, etc.
@@ -1341,8 +1342,25 @@ void fillOutDefaults(void) {
 		if (C.rows < 10) C.rows = 10;
 	}
 
-	// Linuxism
-	const int num_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+	// Linuxism - get # of CPUs this process can use
+	size_t req_maskbits = sizeof(cpu_set_t) * 8;
+	cpu_set_t *set = CPU_ALLOC(req_maskbits);
+	while (true) {
+		if (0 == sched_getaffinity(0, CPU_ALLOC_SIZE(req_maskbits), set))
+			break;
+		if (errno != EINVAL) {
+			perror("could not get CPU affinity");
+			exit(1);
+		}
+		// EINVAL means mask wasn't big enough, so retry
+		CPU_FREE(set);
+		req_maskbits += sizeof(unsigned long) * 8; // word-size increment, see CPU_SET(3)
+		set = CPU_ALLOC(req_maskbits);
+	}
+
+	const int num_cpus = CPU_COUNT_S(CPU_ALLOC_SIZE(req_maskbits), set);
+	CPU_FREE(set);
+
 	if (num_cpus > C.threads) {
 		C.threads = num_cpus;
 	}

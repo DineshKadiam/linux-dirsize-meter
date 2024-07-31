@@ -118,11 +118,11 @@ to show.  The default is the terminal height minus 10.
 Number of
 .Ar threads
 to use for scanning the filesystem.  The default is 4 or the number of
-online processors, whichever is greater.
+available CPUs, whichever is greater
 .Po
 see
-.Xr get_nprocs_conf 3
-.Pc
+.Xr sched_getaffinity 2
+.Pc .
 .
 .It Fl h
 Display a help message.
