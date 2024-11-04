@@ -181,6 +181,33 @@ static void free_entry(struct entry *ent) {
 // Utility functions
 //----------------------------------------------------------
 
+#define DIE(msg) die("dut: " msg)
+static void die(const char *msg) {
+	perror(msg);
+	_Exit(1);
+}
+
+static void *xmalloc(size_t size) {
+	void *tmp = malloc(size);
+	if (!tmp)
+		DIE("fatal error");
+	return tmp;
+}
+
+static void *xcalloc(size_t nmemb, size_t size) {
+	void *tmp = calloc(nmemb, size);
+	if (!tmp)
+		DIE("fatal error");
+	return tmp;
+}
+
+static void *xrealloc(void *ptr, size_t size) {
+	void *tmp = realloc(ptr, size);
+	if (!tmp)
+		DIE("fatal error");
+	return tmp;
+}
+
 static void printUsage(void) {
 	if (!C.color) {
 		// Strip out all escapes
@@ -214,10 +241,8 @@ static void wrFlush(void) {
 	ssize_t pos = 0;
 	while (pos < (ssize_t)displayPos) {
 		ssize_t res = write(STDOUT_FILENO, displayBuf + pos, displayPos - pos);
-		if (res == -1) {
-			perror("could not write to stdout");
-			exit(1);
-		}
+		if (res == -1)
+			DIE("could not write to stdout");
 		pos += res;
 	}
 	displayPos = 0;
@@ -230,10 +255,8 @@ static void wrLen(const char *str, size_t len) {
 	// In case of really big writes (but probably will never happen)
 	while (len > DISPBUFSIZE) {
 		ssize_t res = write(STDOUT_FILENO, str, len);
-		if (res == -1) {
-			perror("could not write to stdout");
-			exit(1);
-		}
+		if (res == -1)
+			DIE("could not write to stdout");
 		str += res;
 		len -= res;
 	}
@@ -311,7 +334,7 @@ static void lt_init(struct link_table *lt) {
 	lt->size = 32; // Default initial size
 	lt->count = 0;
 	lt->deleted = 0;
-	lt->table = (struct hard_link*)calloc(lt->size, sizeof(struct hard_link));
+	lt->table = (struct hard_link*)xcalloc(lt->size, sizeof(struct hard_link));
 }
 
 static void lt_destroy(struct link_table *lt) {
@@ -356,7 +379,7 @@ static struct hard_link *lt_slot(struct link_table *lt, uint64_t dev, uint64_t i
 		struct hard_link *oldTable = lt->table;
 		lt->size = (size_t)nextPwrOf2(lt->count);
 		if (lt->size < 16) lt->size = 16;
-		lt->table = calloc(lt->size, sizeof(struct link_table));
+		lt->table = xcalloc(lt->size, sizeof(struct link_table));
 		lt->deleted = 0;
 		if (oldTable != NULL) {
 			for (size_t i = 0; i < oldSize; i++) {
@@ -579,7 +602,7 @@ doStat(struct thread_locals *const L, int fd, struct entry *root, const struct l
 	if (!S_ISDIR(sbuf.stx_mode)) {
 		if (C.dedupHardLinks && sbuf.stx_nlink > 1) {
 			if (root->lt == NULL) {
-				root->lt = (struct link_table*)malloc(sizeof(struct link_table));
+				root->lt = (struct link_table*)xmalloc(sizeof(struct link_table));
 				lt_init(root->lt);
 			}
 			uint32_t remainingLinks = lt_check(root->lt, dev, sbuf.stx_ino, sbuf.stx_nlink, size);
@@ -602,7 +625,7 @@ doStat(struct thread_locals *const L, int fd, struct entry *root, const struct l
 	}
 
 	const size_t fileLen = strlen(dent->d_name);
-	struct entry *tmp = (struct entry*)calloc(1, sizeof(struct entry) + 2 + fileLen + root->nameLen);
+	struct entry *tmp = (struct entry*)xcalloc(1, sizeof(struct entry) + 2 + fileLen + root->nameLen);
 
 	if (root->name[0] == '/' && root->name[1] == '\0') {
 		tmp->name[0] = '/';
@@ -646,7 +669,7 @@ static void doLs(struct thread_locals *const L, struct entry *const node) {
 		if (result == -1) {
 			if (errno == EINVAL) {
 				L->scr_size *= 2;
-				L->scr = realloc(L->scr, L->scr_size);
+				L->scr = xrealloc(L->scr, L->scr_size);
 				continue;
 			}
 			atomic_store_explicit(&T->encountered_errors, true, memory_order_relaxed);
@@ -706,9 +729,9 @@ static int thread_func(void *data) {
 	struct thread_locals *const L = (struct thread_locals*)data;
 	struct thread_data *const T = L->T;
 	const size_t init_scr_size = 512 * 1024;
-	L->scr = malloc(init_scr_size);
+	L->scr = xmalloc(init_scr_size);
 	L->scr_size = init_scr_size;
-	L->heap = (struct entry**)malloc(sizeof(struct entry *) * C.rows);
+	L->heap = (struct entry**)xmalloc(sizeof(struct entry *) * C.rows);
 	L->heap_filled = 0;
 
 	while (true) {
@@ -759,13 +782,13 @@ traverseDirs(struct entry *dirs, struct entry *files, size_t *res_size) {
 	mtx_init(&T.lock, mtx_plain);
 
 	// Spawn I/O threads
-	struct thread_locals *locals = (struct thread_locals*)malloc(sizeof(struct thread_locals) * C.threads);
-	thrd_t *threads = malloc(sizeof(thrd_t) * (C.threads - 1));
+	struct thread_locals *locals = (struct thread_locals*)xmalloc(sizeof(struct thread_locals) * C.threads);
+	thrd_t *threads = xmalloc(sizeof(thrd_t) * (C.threads - 1));
 	for (int i = 0; i < C.threads - 1; i++) {
 		locals[i].T = &T;
 		if (thrd_success != thrd_create(&threads[i], thread_func, &locals[i])) {
-			fprintf(stderr, "Fatal error: unable to create thread\n");
-			abort();
+			fprintf(stderr, "dut: unable to create thread\n");
+			_Exit(1);
 		}
 	}
 
@@ -858,7 +881,7 @@ static void initLsColors(void) {
 		}
 	}
 
-	color_g.exts = (struct ext_color*)malloc(entries * sizeof(struct ext_color));
+	color_g.exts = (struct ext_color*)xmalloc(entries * sizeof(struct ext_color));
 
 	// Fill out all the exts structs. In the process, add null terminators
 	// to the end of the color strings so wr() works with them.
@@ -1105,8 +1128,8 @@ static void renderDisplay(struct entry *root, size_t num_ents, struct entry *con
 	// 1 for root nodes, 1 for (total)
 	max_depth += 2;
 
-	struct entry **arena = (struct entry**)malloc(sizeof(struct entry*) * num_ents);
-	struct render_stack *stk = (struct render_stack*)malloc(sizeof(struct render_stack) * max_depth);
+	struct entry **arena = (struct entry**)xmalloc(sizeof(struct entry*) * num_ents);
+	struct render_stack *stk = (struct render_stack*)xmalloc(sizeof(struct render_stack) * max_depth);
 
 	stk_init(stk, root, arena, 0);
 	// inv: stk[depth] == current state, arena[arrPos..arrLen] already set up and sorted, stk[depth-1].i is 1 too high
@@ -1225,7 +1248,7 @@ makeSearchList(int count, char *paths[], struct entry **dirs, struct entry **fil
 	struct entry *root;
 	struct stat sbuf;
 	if (count == 0) {
-		root = (struct entry*)calloc(1, sizeof(struct entry) + 2);
+		root = (struct entry*)xcalloc(1, sizeof(struct entry) + 2);
 		root->name[0] = '.';
 		root->nameLen = 1;
 		*dirs = root;
@@ -1239,10 +1262,10 @@ makeSearchList(int count, char *paths[], struct entry **dirs, struct entry **fil
 
 	// This is a special node to represent the grand total
 	const char total[] = "(total)";
-	root = (struct entry*)calloc(1, sizeof(struct entry) + sizeof(total));
+	root = (struct entry*)xcalloc(1, sizeof(struct entry) + sizeof(total));
 	memcpy(root->name, total, sizeof(total));
 	root->nameLen = sizeof(total) - 1;
-	root->lt = (struct link_table*)calloc(1, sizeof(struct link_table));
+	root->lt = (struct link_table*)xcalloc(1, sizeof(struct link_table));
 	lt_init(root->lt);
 
 	// Stat all inputs and get absolute path
@@ -1252,10 +1275,10 @@ makeSearchList(int count, char *paths[], struct entry **dirs, struct entry **fil
 		char *abs;
 		size_t absLen;
 	};
-	struct candidate *const cands = (struct candidate*)malloc(sizeof(struct candidate) * count);
+	struct candidate *const cands = (struct candidate*)xmalloc(sizeof(struct candidate) * count);
 	for (int i = 0; i < count; i++) {
 		const size_t nameLen = strlen(paths[i]);
-		cands[i].node = (struct entry*)calloc(1, sizeof(struct entry) + nameLen + 2);
+		cands[i].node = (struct entry*)xcalloc(1, sizeof(struct entry) + nameLen + 2);
 		struct entry *n = cands[i].node;
 		n->parent = root;
 		strcpy(n->name, paths[i]);
@@ -1345,17 +1368,20 @@ void fillOutDefaults(void) {
 	// Linuxism - get # of CPUs this process can use
 	size_t req_maskbits = sizeof(cpu_set_t) * 8;
 	cpu_set_t *set = CPU_ALLOC(req_maskbits);
+	if (!set)
+		DIE("fatal error");
 	while (true) {
 		if (0 == sched_getaffinity(0, CPU_ALLOC_SIZE(req_maskbits), set))
 			break;
 		if (errno != EINVAL) {
-			perror("could not get CPU affinity");
-			exit(1);
+			DIE("could not get CPU affinity");
 		}
 		// EINVAL means mask wasn't big enough, so retry
 		CPU_FREE(set);
 		req_maskbits += sizeof(unsigned long) * 8; // word-size increment, see CPU_SET(3)
 		set = CPU_ALLOC(req_maskbits);
+		if (!set)
+			DIE("fatal error");
 	}
 
 	const int num_cpus = CPU_COUNT_S(CPU_ALLOC_SIZE(req_maskbits), set);
