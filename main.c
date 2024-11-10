@@ -46,11 +46,12 @@ adding -pthread -latomic should fix it.
 #include <sys/ioctl.h>
 #include <sys/stat.h>     // statx(2)
 #include <sys/syscall.h>  // syscall wrapper for getdents64
+#include <sys/sysmacros.h>// makedev
 #include <threads.h>      // thrd_create(3), etc.
 #include <unistd.h>       // close(2), write(2)
 
 //----------------------------------------------------------
-// Forward definitions
+// Forward declarations
 //----------------------------------------------------------
 
 struct link_table;
@@ -100,6 +101,7 @@ OPT("l", "count every instance of a hard link")
 OPT("s", "use size of files instead of size on disk")
 OPT("b", "show sizes in plain bytes intead of human readable format")
 OPT("p", "display full path of files in the tree")
+OPT("x", "don't cross filesystems when searching for files")
 OPTa("d", "depth limit to show in output")
 OPTa("i", "number of spaces for each level of indentation (default 2)")
 OPTa("n", "number of rows to show (default is terminal size - 10)")
@@ -133,6 +135,7 @@ struct Config {
 	bool fileLength : 1;
 	bool humanReadable : 1;
 	bool fullPath : 1;
+	bool limitToDevs : 1;
 };
 
 static struct Config C = {
@@ -145,6 +148,7 @@ static struct Config C = {
 	.fileLength = false,
 	.humanReadable = true,
 	.fullPath = false,
+	.limitToDevs = false,
 };
 
 // All the data about individual files and directories is in this struct
@@ -175,6 +179,19 @@ static void free_entry(struct entry *ent) {
 		free(ent->lt);
 	}
 	free(ent);
+}
+
+// List of devices to limit the search to
+static size_t num_devices;
+static uint64_t *devices;
+
+// Returns true iff dev is one of the devices to look for files in
+static bool is_wanted_device(uint64_t dev) {
+	if (!C.limitToDevs) return true;
+	for (size_t i = 0; i < num_devices; i++) {
+		if (dev == devices[i]) return true;
+	}
+	return false;
 }
 
 //----------------------------------------------------------
@@ -543,8 +560,8 @@ mergeTables(struct entry *node, struct link_table *lt) {
 	return parent;
 }
 
-// Sends this node to main, and updates parents sending them to main as well if
-// necessary
+// Add node to this thread's heap, and do the same for parent nodes if this was the
+// last one.
 static void finishNode(struct thread_locals *L, struct entry *node) {
 	int prev = 1;
 	struct link_table *lt = node->lt;
@@ -591,7 +608,10 @@ doStat(struct thread_locals *const L, int fd, struct entry *root, const struct l
 		return NULL;
 	}
 
-	uint64_t dev = (uint64_t)sbuf.stx_dev_major << 32 | (uint64_t)sbuf.stx_dev_minor;
+	uint64_t dev = makedev(sbuf.stx_dev_major, sbuf.stx_dev_minor);
+	if (!is_wanted_device(dev))
+		return NULL;
+
 	uint64_t size;
 	if (C.fileLength) {
 		size = sbuf.stx_size;
@@ -681,7 +701,7 @@ static void doLs(struct thread_locals *const L, struct entry *const node) {
 
 		dents_len += result;
 	}
-			
+
 	// Process each entry one at a time, only allocating a struct for dirs or large files
 	struct entry *dirs = NULL;
 	struct entry **dirsLastPtr = &dirs;
@@ -721,7 +741,6 @@ static void doLs(struct thread_locals *const L, struct entry *const node) {
 	} else {
 		finishNode(L, node);
 	}
-	return;
 }
 
 static int thread_func(void *data) {
@@ -807,6 +826,7 @@ traverseDirs(struct entry *dirs, struct entry *files, size_t *res_size) {
 		free(locals[i].heap);
 	}
 
+	// Sum up the individual files given as command line arguments
 	while (files != NULL) {
 		struct entry *tmp = files;
 		files = files->next;
@@ -1110,6 +1130,9 @@ static void stk_init(struct render_stack *stk, struct entry *node, struct entry 
 }
 
 static void renderDisplay(struct entry *root, size_t num_ents, struct entry *const *arr) {
+	// root is not in the heap if only files were given on the command line
+	root->children = NULL;
+	root->num_children = 0;
 	for (size_t i = 0; i < num_ents; i++) {
 		// UB to not do this?
 		arr[i]->children = NULL;
@@ -1128,7 +1151,7 @@ static void renderDisplay(struct entry *root, size_t num_ents, struct entry *con
 	// 1 for root nodes, 1 for (total)
 	max_depth += 2;
 
-	struct entry **arena = (struct entry**)xmalloc(sizeof(struct entry*) * num_ents);
+	struct entry **arena = (struct entry**)xmalloc(sizeof(struct entry*) * (num_ents + 1));
 	struct render_stack *stk = (struct render_stack*)xmalloc(sizeof(struct render_stack) * max_depth);
 
 	stk_init(stk, root, arena, 0);
@@ -1245,6 +1268,8 @@ static bool statNode(struct stat *sbuf, struct entry *ent) {
 // Returns root node. dirs and files are output args for children of root and potentially root
 static struct entry *
 makeSearchList(int count, char *paths[], struct entry **dirs, struct entry **files) {
+	if (C.limitToDevs)
+		devices = malloc(sizeof(uint64_t) * (count + 1));
 	struct entry *root;
 	struct stat sbuf;
 	if (count == 0) {
@@ -1257,6 +1282,10 @@ makeSearchList(int count, char *paths[], struct entry **dirs, struct entry **fil
 		root->size = 512 * sbuf.st_blocks;
 		if (C.fileLength)
 			root->size = sbuf.st_size;
+		if (C.limitToDevs) {
+			num_devices = 1;
+			*devices = sbuf.st_dev;
+		}
 		return root;
 	}
 
@@ -1292,6 +1321,9 @@ makeSearchList(int count, char *paths[], struct entry **dirs, struct entry **fil
 			continue;
 		}
 		cands[i].abs = realpath(n->name, NULL);
+		if (C.limitToDevs && !is_wanted_device(sbuf.st_dev)) {
+			devices[num_devices++] = sbuf.st_dev;
+		}
 		if (cands[i].abs == NULL) {
 			fprintf(stderr, "Invalid argument %s: %s\n", paths[i], strerror(errno));
 			free_entry(n);
@@ -1398,7 +1430,7 @@ int main(int argc, char* argv[]) {
 	bool argErrors = false;
 	bool printHelp = false;
 	while (true) {
-		int c = getopt(argc, argv, "cClbpsi:n:d:t:hv");
+		int c = getopt(argc, argv, "cClsbpxi:n:d:t:hv");
 		if (c == -1)
 			break;
 
@@ -1420,6 +1452,9 @@ int main(int argc, char* argv[]) {
 			break;
 		case 'p':
 			C.fullPath = true;
+			break;
+		case 'x':
+			C.limitToDevs = true;
 			break;
 		case 'i':
 			// indentation level
@@ -1482,6 +1517,7 @@ int main(int argc, char* argv[]) {
 
 	size_t num_ents;
 	struct entry **final_entries = traverseDirs(dirs, files, &num_ents);
+	free(devices);
 
 	if (num_ents != 0) {
 		renderDisplay(root, num_ents, final_entries);
