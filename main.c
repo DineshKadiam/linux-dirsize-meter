@@ -1126,7 +1126,8 @@ static void stk_init(struct render_stack *stk, struct entry *node, struct entry 
 	for (struct entry *e = node->children; e != NULL; e = e->next, i++) {
 		arena[arrPos + i] = e;
 	}
-	qsort(arena + arrPos, stk->arrLen, sizeof(struct entry*), qsort_entry_compare);
+	// At this point, i is equal to the number of children of `node`
+	qsort(arena + arrPos, i, sizeof(struct entry*), qsort_entry_compare);
 }
 
 static void renderDisplay(struct entry *root, size_t num_ents, struct entry *const *arr) {
