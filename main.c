@@ -117,7 +117,7 @@ OPT("v", "display version information");
 #undef OPTa
 
 const char VERSION[] =
-"dut 0.1\n"
+"dut 1.0\n"
 "Copyright (C) 2024\n"
 "License GPLv3+: GNU GPL version 3 or later <https://gnu.org/licenses/gpl.html>.\n"
 "This is free software: you are free to change and redistribute it.\n"
