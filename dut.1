@@ -1,4 +1,4 @@
-.Dd July 13, 2023
+.Dd November 16, 2025
 .Dt DUT 1
 .Os
 .
@@ -8,7 +8,7 @@
 .
 .Sh SYNOPSIS
 .Nm
-.Op Fl cClsbphv
+.Op Fl cClsfbpxhv
 .Op Fl d Ar depth
 .Op Fl i Ar indent
 .Op Fl n Ar rows
@@ -95,6 +95,9 @@ Show sizes in plain bytes intead of human readable format.
 .
 .It Fl s
 Count size of files instead of size on disk.
+.
+.It Fl f
+Count number of files and directories instead of size on disk.
 .
 .It Fl p
 Display full path of files in the tree.

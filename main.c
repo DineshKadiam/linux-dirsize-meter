@@ -1,6 +1,6 @@
 /*
 dut - A disk usage calculator for Linux.
-Copyright (C) 2024
+Copyright (C) 2025
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -66,7 +66,7 @@ static void lt_destroy(struct link_table*);
 #define U "\033[4m"
 #define L "\033[2m"
 #define OPT(flag, desc) B "\t-" flag R ": " desc "\n"
-#define OPTa(flag, desc) B "\t-" flag R ": \033[2m<n>" R ": " desc "\n"
+#define OPTa(flag, desc) B "\t-" flag R " \033[2m<n>" R ": " desc "\n"
 
 const char USAGE[] =
 "A disk usage summarizer\n"
@@ -99,6 +99,7 @@ OPT("c", "disable colorized output")
 OPT("C", "enable colorized output")
 OPT("l", "count every instance of a hard link")
 OPT("s", "use size of files instead of size on disk")
+OPT("f", "count number of files and directories instead of size of files")
 OPT("b", "show sizes in plain bytes intead of human readable format")
 OPT("p", "display full path of files in the tree")
 OPT("x", "don't cross filesystems when searching for files")
@@ -117,22 +118,27 @@ OPT("v", "display version information");
 #undef OPTa
 
 const char VERSION[] =
-"dut 1.0\n"
-"Copyright (C) 2024\n"
+"dut 1.1\n"
+"Copyright (C) 2025\n"
 "License GPLv3+: GNU GPL version 3 or later <https://gnu.org/licenses/gpl.html>.\n"
 "This is free software: you are free to change and redistribute it.\n"
 "There is NO WARRANTY, to the extent permitted by law.\n"
 "\n"
 "Homepage: https://codeberg.org/201984/dut\n";
 
+enum {
+	CNT_SPACE, // Size on disk
+	CNT_LEN, // Length of file
+	CNT_NUM, // Number of files
+};
 struct Config {
 	int indentSize;
 	int rows;
 	int maxDepth;
 	int threads;
+	uint8_t countType;
 	bool color : 1;
 	bool dedupHardLinks : 1;
-	bool fileLength : 1;
 	bool humanReadable : 1;
 	bool fullPath : 1;
 	bool limitToDevs : 1;
@@ -143,9 +149,9 @@ static struct Config C = {
 	.rows = 20,
 	.maxDepth = 10,
 	.threads = 4,
+	.countType = CNT_SPACE,
 	.color = true,
 	.dedupHardLinks = true,
-	.fileLength = false,
 	.humanReadable = true,
 	.fullPath = false,
 	.limitToDevs = false,
@@ -613,10 +619,14 @@ doStat(struct thread_locals *const L, int fd, struct entry *root, const struct l
 		return NULL;
 
 	uint64_t size;
-	if (C.fileLength) {
-		size = sbuf.stx_size;
-	} else {
-		size = 512 * sbuf.stx_blocks;
+	switch (C.countType) {
+	case CNT_SPACE:
+		size = 512 * sbuf.stx_blocks; break;
+	case CNT_LEN:
+		size = sbuf.stx_size; break;
+	case CNT_NUM:
+	default: // Unreachable. Only needed to prevent warning.
+		size = 1;
 	}
 
 	if (!S_ISDIR(sbuf.stx_mode)) {
@@ -1018,7 +1028,7 @@ static void wrFileName(struct entry *node) {
 
 static void renderHumanReadable(uint64_t size) {
 	if (size == 0) {
-		wr("   0B ");
+		wr(C.countType == CNT_NUM ? "   0  " : "   0B ");
 		return;
 	}
 
@@ -1032,18 +1042,21 @@ static void renderHumanReadable(uint64_t size) {
 
 	// Get order of magnitude and reduce size
 	size *= 10;
-	const char *suffix = suffixes;
+	uint8_t order_mag = 0;
 	while (size > 10240) {
 		size /= 1024;
-		suffix++;
+		order_mag++;
 	}
+	char suffix = suffixes[order_mag];
+	if (suffix == 'B' && C.countType == CNT_NUM)
+		suffix = ' ';
 
 	// Render backwards to finalBuf
 	char finalBuf[7] = {0};
 	int idx = 5;
 	finalBuf[idx--] = ' ';
-	finalBuf[idx--] = *suffix;
-	if (size < 100) {
+	finalBuf[idx--] = suffix;
+	if (size < 100 && order_mag != 0) {
 		finalBuf[idx--] = size % 10 + '0';
 		finalBuf[idx--] = '.';
 	}
@@ -1244,10 +1257,13 @@ static bool statNode(struct stat *sbuf, struct entry *ent) {
 		return false;
 
 	ent->st_mode = sbuf->st_mode;
-	if (C.fileLength) {
-		ent->size = sbuf->st_size;
-	} else {
-		ent->size = 512 * sbuf->st_blocks;
+	switch (C.countType) {
+	case CNT_SPACE:
+		ent->size = 512 * sbuf->st_blocks; break;
+	case CNT_LEN:
+		ent->size = sbuf->st_size; break;
+	case CNT_NUM:
+		ent->size = 1;
 	}
 
 	if (!S_ISDIR(sbuf->st_mode)) {
@@ -1280,9 +1296,16 @@ makeSearchList(int count, char *paths[], struct entry **dirs, struct entry **fil
 		*dirs = root;
 		lstat(root->name, &sbuf);
 		root->st_mode = sbuf.st_mode;
-		root->size = 512 * sbuf.st_blocks;
-		if (C.fileLength)
-			root->size = sbuf.st_size;
+
+		switch (C.countType) {
+		case CNT_SPACE:
+			root->size = 512 * sbuf.st_blocks; break;
+		case CNT_LEN:
+			root->size = sbuf.st_size; break;
+		case CNT_NUM:
+			root->size = 1;
+		}
+
 		if (C.limitToDevs) {
 			num_devices = 1;
 			*devices = sbuf.st_dev;
@@ -1431,7 +1454,7 @@ int main(int argc, char* argv[]) {
 	bool argErrors = false;
 	bool printHelp = false;
 	while (true) {
-		int c = getopt(argc, argv, "cClsbpxi:n:d:t:hv");
+		int c = getopt(argc, argv, "cClsfbpxi:n:d:t:hv");
 		if (c == -1)
 			break;
 
@@ -1446,7 +1469,10 @@ int main(int argc, char* argv[]) {
 			C.dedupHardLinks = false;
 			break;
 		case 's':
-			C.fileLength = true;
+			C.countType = CNT_LEN;
+			break;
+		case 'f':
+			C.countType = CNT_NUM;
 			break;
 		case 'b':
 			C.humanReadable = false;
