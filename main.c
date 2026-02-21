@@ -224,13 +224,6 @@ static void *xcalloc(size_t nmemb, size_t size) {
 	return tmp;
 }
 
-static void *xrealloc(void *ptr, size_t size) {
-	void *tmp = realloc(ptr, size);
-	if (!tmp)
-		DIE("fatal error");
-	return tmp;
-}
-
 static void printUsage(void) {
 	if (!C.color) {
 		// Strip out all escapes
@@ -697,11 +690,6 @@ static void doLs(struct thread_locals *const L, struct entry *const node) {
 		void *wr = (void*)((char*)L->scr + dents_len);
 		ssize_t result = syscall(SYS_getdents64, fd, wr, L->scr_size - dents_len);
 		if (result == -1) {
-			if (errno == EINVAL) {
-				L->scr_size *= 2;
-				L->scr = xrealloc(L->scr, L->scr_size);
-				continue;
-			}
 			atomic_store_explicit(&T->encountered_errors, true, memory_order_relaxed);
 			finishNode(L, node);
 			return;
@@ -757,7 +745,7 @@ static int thread_func(void *data) {
 	// Stopping condition: work queues are empty and all other threads are blocked
 	struct thread_locals *const L = (struct thread_locals*)data;
 	struct thread_data *const T = L->T;
-	const size_t init_scr_size = 512 * 1024;
+	const size_t init_scr_size = 1024 * 1024;
 	L->scr = xmalloc(init_scr_size);
 	L->scr_size = init_scr_size;
 	L->heap = (struct entry**)xmalloc(sizeof(struct entry *) * C.rows);
