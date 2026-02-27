@@ -685,40 +685,36 @@ static void doLs(struct thread_locals *const L, struct entry *const node) {
 	}
 
 	// Read entire directory stream into scratch
-	size_t dents_len = 0;
-	while (true) {
-		void *wr = (void*)((char*)L->scr + dents_len);
-		ssize_t result = syscall(SYS_getdents64, fd, wr, L->scr_size - dents_len);
-		if (result == -1) {
-			atomic_store_explicit(&T->encountered_errors, true, memory_order_relaxed);
-			finishNode(L, node);
-			return;
-		} else if (result == 0) {
-			break;
-		}
-
-		dents_len += result;
-	}
-
-	// Process each entry one at a time, only allocating a struct for dirs or large files
 	struct entry *dirs = NULL;
 	struct entry **dirsLastPtr = &dirs;
 	uint64_t children = 0;
-	size_t pos = 0;
-	while (pos < dents_len) {
-		const struct linux_dirent64 *dent = (struct linux_dirent64*)((char*)L->scr + pos);
-		pos += dent->d_reclen;
-
-		if (dent->d_name[0] == '.' && (dent->d_name[1] == '\0'
-				|| (dent->d_name[1] == '.' && dent->d_name[2] == '\0'))) {
-			continue;
+	while (true) {
+		ssize_t dents_len = syscall(SYS_getdents64, fd, L->scr, L->scr_size);
+		if (dents_len == -1) {
+			atomic_store_explicit(&T->encountered_errors, true, memory_order_relaxed);
+			finishNode(L, node);
+			return;
+		} else if (dents_len == 0) {
+			break;
 		}
 
-		struct entry *dir = doStat(L, fd, node, dent);
-		if (dir != NULL) {
-			*dirsLastPtr = dir;
-			dirsLastPtr = &dir->next;
-			children++;
+		// Process each entry one at a time, only allocating a struct for dirs or large files
+		ssize_t pos = 0;
+		while (pos < dents_len) {
+			const struct linux_dirent64 *dent = (struct linux_dirent64*)((char*)L->scr + pos);
+			pos += dent->d_reclen;
+
+			if (dent->d_name[0] == '.' && (dent->d_name[1] == '\0'
+					|| (dent->d_name[1] == '.' && dent->d_name[2] == '\0'))) {
+				continue;
+			}
+
+			struct entry *dir = doStat(L, fd, node, dent);
+			if (dir != NULL) {
+				*dirsLastPtr = dir;
+				dirsLastPtr = &dir->next;
+				children++;
+			}
 		}
 	}
 
