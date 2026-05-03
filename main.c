@@ -833,7 +833,7 @@ traverseDirs(struct entry *dirs, struct entry *files, size_t *res_size) {
 	}
 
 	if (T.encountered_errors) {
-		fprintf(stderr, "Encountered errors while searching directories. Reported sizes may be innaccurate.\n");
+		fprintf(stderr, "Encountered errors while searching directories. Reported sizes may be inaccurate.\n");
 	}
 
 	free(threads);
