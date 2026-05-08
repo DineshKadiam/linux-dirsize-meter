@@ -395,7 +395,7 @@ static struct hard_link *lt_slot(struct link_table *lt, uint64_t dev, uint64_t i
 		struct hard_link *oldTable = lt->table;
 		lt->size = (size_t)nextPwrOf2(lt->count);
 		if (lt->size < 16) lt->size = 16;
-		lt->table = xcalloc(lt->size, sizeof(struct link_table));
+		lt->table = xcalloc(lt->size, sizeof(struct hard_link));
 		lt->deleted = 0;
 		if (oldTable != NULL) {
 			for (size_t i = 0; i < oldSize; i++) {
