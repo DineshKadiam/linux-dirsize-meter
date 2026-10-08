@@ -1012,7 +1012,7 @@ static void wrFileName(struct entry *node) {
 
 static void renderHumanReadable(uint64_t size) {
 	if (size == 0) {
-		wr(C.countType == CNT_NUM ? "   0  " : "   0B ");
+		wrLen(C.countType == CNT_NUM ? "   0  " : "   0B ", 6);
 		return;
 	}
 
