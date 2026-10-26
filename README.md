@@ -1,3 +1,5 @@
+> Originally developed at [codeberg.org/201984/dut](https://codeberg.org/201984/dut) · GPL-3.0
+
 # dut - A disk usage calculator for Linux
 
 ## Features
